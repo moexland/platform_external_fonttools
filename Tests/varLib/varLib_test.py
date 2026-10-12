@@ -1,3 +1,5 @@
+from collections import OrderedDict
+
 from fontTools.colorLib.builder import buildCOLR
 from fontTools.ttLib import TTFont, newTable
 from fontTools.ttLib.tables import otTables as ot
@@ -6,6 +8,7 @@ from fontTools.varLib import (
     build_many,
     load_designspace,
     _add_COLR,
+    _add_avar,
     addGSUBFeatureVariations,
 )
 from fontTools.varLib.errors import VarLibValidationError
@@ -15,6 +18,7 @@ from fontTools.varLib.mutator import instantiateVariableFont
 from fontTools.varLib import main as varLib_main, load_masters
 from fontTools.varLib import set_default_weight_width_slant
 from fontTools.designspaceLib import (
+    AxisDescriptor,
     DesignSpaceDocumentError,
     DesignSpaceDocument,
     SourceDescriptor,
@@ -40,6 +44,71 @@ def reload_font(font):
     font.close()
     buf.seek(0)
     return TTFont(buf)
+
+
+def test_varlib_avar_accepts_identical_duplicate_axis_map_input():
+    axis = AxisDescriptor(
+        name="Weight",
+        tag="wght",
+        minimum=100,
+        default=400,
+        maximum=900,
+        map=[
+            (100, 80),
+            (400, 450),
+            (400, 450),
+            (600, 700),
+            (900, 1000),
+        ],
+    )
+
+    avar = _add_avar(
+        TTFont(),
+        OrderedDict([(axis.name, axis)]),
+        mappings=[],
+        axisTags=[axis.tag],
+    )
+
+    assert avar.segments[axis.tag] == {
+        -1.0: -1.0,
+        0.0: 0.0,
+        1.0: 1.0,
+        0.4: 5 / 11,
+    }
+
+
+def test_varlib_avar_rejects_conflicting_duplicate_axis_map_input():
+    axis = AxisDescriptor(
+        name="Weight",
+        tag="wght",
+        minimum=100,
+        default=400,
+        maximum=900,
+        map=[(100, 80), (400, 450), (600, 700), (400, 500), (900, 1000)],
+    )
+
+    with pytest.raises(DesignSpaceDocumentError, match="Axis 'Weight'"):
+        _add_avar(
+            TTFont(),
+            OrderedDict([(axis.name, axis)]),
+            mappings=[],
+            axisTags=[axis.tag],
+        )
+
+
+def test_varlib_build_conflicting_default_map_raises_designspace_error():
+    designspace = DesignSpaceDocument.fromfile(
+        os.path.join(os.path.dirname(__file__), "data", "Build.designspace")
+    )
+    axis = next(axis for axis in designspace.axes if axis.name == "weight")
+    # A last-wins temporary dict previously shifted the duplicate default's
+    # normalized value from zero, causing a misleading "Base master not found"
+    # before _add_avar.
+    axis.map = [(0, 0), (368, 368), (368, 369), (1000, 1000)]
+
+    with pytest.raises(DesignSpaceDocumentError, match="input value 368") as exc_info:
+        build(designspace)
+    assert "Base master not found" not in str(exc_info.value)
 
 
 class BuildTest(unittest.TestCase):
@@ -173,6 +242,15 @@ class BuildTest(unittest.TestCase):
             font_name="TestFamily",
             tables=["GDEF", "HVAR", "MVAR", "fvar", "gvar"],
             expected_ttx_name="Build",
+        )
+
+    def test_varlib_build_ttf_reuse_nameid_2(self):
+        """Instances at the default location can reuse name ID 2 or 17."""
+        self._run_varlib_build_test(
+            designspace_name="BuildReuseNameId2",
+            font_name="TestFamily",
+            tables=["fvar"],
+            expected_ttx_name="BuildReuseNameId2",
         )
 
     def test_varlib_build_no_axes_ttf(self):
@@ -337,12 +415,38 @@ class BuildTest(unittest.TestCase):
             post_process_master=add_rclt,
         )
 
+    def test_varlib_build_feature_variations_without_latn_dflt_feature(self):
+        """Test that when a script does not have a dflt language, it gets one
+        when we later add variations, we can attach them to it."""
+
+        def add_features(font, savepath):
+            features = """
+            languagesystem DFLT dflt;
+            languagesystem latn dflt;
+            languagesystem latn CAT;
+
+            feature locl {
+                script latn;
+                # Intentionally skip defining anything for `language dflt;`.
+                language CAT;
+                sub uni0061 by uni0061;
+            } locl;
+            """
+            addOpenTypeFeaturesFromString(font, features)
+            font.save(savepath)
+
+        self._run_varlib_build_test(
+            designspace_name="FeatureVars",
+            font_name="TestFamily",
+            tables=["GSUB"],
+            expected_ttx_name="FeatureVars_latn_dflt_var",
+            save_before_dump=True,
+            post_process_master=add_features,
+        )
+
     def test_varlib_gvar_explicit_delta(self):
         """The variable font contains a composite glyph odieresis which does not
-        need a gvar entry, because all its deltas are 0, but it must be added
-        anyway to work around an issue with macOS 10.14.
-
-        https://github.com/fonttools/fonttools/issues/1381
+        need a gvar entry.
         """
         test_name = "BuildGvarCompositeExplicitDelta"
         self._run_varlib_build_test(
@@ -556,6 +660,54 @@ class BuildTest(unittest.TestCase):
 
         self.assertTrue(os.path.isdir(outdir))
         self.assertTrue(os.path.exists(os.path.join(outdir, "BuildMain-VF.ttf")))
+
+    def test_varLib_main_output_dir_contains_traversal_name(self):
+        # A designspace can name a variable font with path separators; that name
+        # is used to build the output filename, so an un-basenamed name escapes
+        # --output-dir. The compile step is stubbed out to isolate path handling.
+        from unittest import mock
+        from fontTools.designspaceLib import (
+            RangeAxisSubsetDescriptor,
+            VariableFontDescriptor,
+        )
+
+        self.temp_dir()
+        outdir = os.path.join(self.tempdir, "output_dir_traversal_test")
+        os.makedirs(outdir)
+
+        doc = DesignSpaceDocument()
+        axis = AxisDescriptor()
+        axis.name = "Weight"
+        axis.tag = "wght"
+        axis.minimum, axis.default, axis.maximum = 400, 400, 700
+        doc.addAxis(axis)
+        doc.addVariableFont(
+            VariableFontDescriptor(
+                name="../escaped",
+                axisSubsets=[RangeAxisSubsetDescriptor(name="Weight")],
+            )
+        )
+        doc.formatVersion = "5.0"
+        ds_path = os.path.join(self.tempdir, "traversal.designspace")
+        doc.write(ds_path)
+
+        class FakeVF:
+            sfntVersion = "\x00\x01\x00\x00"
+
+            def save(self, path):
+                with open(path, "wb") as f:
+                    f.write(b"")
+
+        with mock.patch(
+            "fontTools.varLib.build_many",
+            lambda designspace, finder, **kw: {
+                vf.name: FakeVF() for vf in designspace.getVariableFonts()
+            },
+        ):
+            varLib_main([ds_path, "--output-dir", outdir])
+
+        self.assertTrue(os.path.exists(os.path.join(outdir, "escaped.ttf")))
+        self.assertFalse(os.path.exists(os.path.join(self.tempdir, "escaped.ttf")))
 
     def test_varLib_main_drop_implied_oncurves(self):
         self.temp_dir()
@@ -1040,6 +1192,61 @@ Expected to see .ScriptCount==1, instead saw 0""",
         expected_ttx_path = self.get_test_output("FeatureVars.ttx")
         self.expect_ttx(varfont, expected_ttx_path, tables)
         self.check_ttx_dump(varfont, expected_ttx_path, tables, ".ttf")
+
+    def test_varlib_build_inconsistent_use_my_metrics_flags(self):
+        self._run_varlib_build_test(
+            designspace_name="InconsistentUseMyMetrics",
+            font_name="InconsistentUseMyMetrics",
+            tables=["GlyphOrder", "hmtx", "glyf", "fvar", "HVAR"],
+            expected_ttx_name="InconsistentUseMyMetrics-VF",
+            save_before_dump=True,
+        )
+
+    def test_varlib_path_traversal_sanitized(self):
+        """Test that path traversal in <variable-font> filename is sanitized.
+
+        Only the basename should be used.
+        """
+        self.temp_dir()
+        ttx_dir = self.get_test_input("master_ttx_interpolatable_ttf")
+        ttf_dir = os.path.join(self.tempdir, "masters")
+        os.makedirs(ttf_dir)
+        for path in self.get_file_list(ttx_dir, ".ttx", "TestFamily-"):
+            self.compile_font(path, ".ttf", ttf_dir)
+
+        # Test path traversal: "../forbidden/evil.ttf" should become "evil.ttf"
+        ds_path = os.path.join(self.tempdir, "test.designspace")
+        with open(ds_path, "w", encoding="utf-8") as f:
+            f.write("""<?xml version='1.0' encoding='UTF-8'?>
+<designspace format="5.0">
+    <axes>
+        <axis tag="wght" name="Weight" minimum="300" maximum="700" default="300"/>
+    </axes>
+    <sources>
+        <source filename="masters/TestFamily-Master0.ttf" name="Light">
+            <location><dimension name="Weight" xvalue="300"/></location>
+        </source>
+        <source filename="masters/TestFamily-Master2.ttf" name="Bold">
+            <location><dimension name="Weight" xvalue="700"/></location>
+        </source>
+    </sources>
+    <variable-fonts>
+        <variable-font name="TestFamily" filename="../forbidden/evil.ttf">
+            <axis-subsets>
+                <axis-subset name="Weight"/>
+            </axis-subsets>
+        </variable-font>
+    </variable-fonts>
+</designspace>""")
+
+        # Run without --output-dir (defaults to designspace directory)
+        varLib_main([ds_path])
+
+        # Verify file is in same directory as designspace and not in ../forbidden/
+        self.assertTrue(os.path.isfile(os.path.join(self.tempdir, "evil.ttf")))
+        self.assertFalse(
+            os.path.exists(os.path.join(self.tempdir, "..", "forbidden", "evil.ttf"))
+        )
 
 
 def test_load_masters_layerName_without_required_font():

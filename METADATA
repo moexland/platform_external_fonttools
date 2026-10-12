@@ -7,14 +7,14 @@ description: "fontTools is a library for manipulating fonts, written in Python."
 third_party {
   license_type: NOTICE
   last_upgrade_date {
-    year: 2024
-    month: 4
-    day: 1
+    year: 2026
+    month: 10
+    day: 12
   }
   homepage: "https://github.com/fonttools/fonttools"
   identifier {
     type: "Archive"
-    value: "https://github.com/fonttools/fonttools/archive/4.49.0.zip"
-    version: "4.49.0"
+    value: "https://github.com/fonttools/fonttools/archive/4.66.1.zip"
+    version: "4.66.1"
   }
 }

@@ -1,10 +1,17 @@
-from fontTools.cffLib import TopDict, PrivateDict, CharStrings
+import os
+import sys
+
+libdir = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))), "Lib"
+)
+sys.path.insert(0, libdir)
+
+from fontTools.cffLib import TopDict, PrivateDict, CharStrings, CFFFontSet
 from fontTools.misc.testTools import parseXML, DataFilesHandler
 from fontTools.ttLib import TTFont
 import copy
-import os
-import sys
 import unittest
+from io import BytesIO
 
 
 class CffLibTest(DataFilesHandler):
@@ -14,8 +21,7 @@ class CffLibTest(DataFilesHandler):
         topDict.CharStrings.fromXML(
             None,
             None,
-            parseXML(
-                """
+            parseXML("""
             <CharString name=".notdef">
               endchar
             </CharString>
@@ -28,8 +34,7 @@ class CffLibTest(DataFilesHandler):
             <CharString name="baz"><!-- [-55.1, -55.1, 55.1, 55.1] -->
               -55.1 -55.1 rmoveto 110.2 hlineto 110.2 vlineto -110.2 hlineto endchar
             </CharString>
-        """
-            ),
+        """),
         )
 
         topDict.recalcFontBBox()
@@ -41,16 +46,14 @@ class CffLibTest(DataFilesHandler):
         topDict.CharStrings.fromXML(
             None,
             None,
-            parseXML(
-                """
+            parseXML("""
             <CharString name=".notdef">
               endchar
             </CharString>
             <CharString name="space">
               123 endchar
             </CharString>
-        """
-            ),
+        """),
         )
 
         topDict.recalcFontBBox()
@@ -89,6 +92,26 @@ class CffLibTest(DataFilesHandler):
         font.importXML(ttx_path)
         copy.deepcopy(font)
 
+    def test_CFF2_VarStore_recompiled_after_mutation(self):
+        """A VarStore changed after a save must be written out as changed."""
+        ttx_path = self.getpath("TestSparseCFF2VF.ttx")
+        font = TTFont(recalcBBoxes=False, recalcTimestamp=False)
+        font.importXML(ttx_path)
+        font.save(BytesIO())
+
+        varStore = font["CFF2"].cff.topDictIndex[0].VarStore.otVarStore
+        varStore.VarRegionList.Region[0].VarRegionAxis[0].PeakCoord = 0.5
+
+        buf = BytesIO()
+        font.save(buf)
+        buf.seek(0)
+        font2 = TTFont(buf)
+
+        varStore2 = font2["CFF2"].cff.topDictIndex[0].VarStore.otVarStore
+        self.assertEqual(
+            varStore2.VarRegionList.Region[0].VarRegionAxis[0].PeakCoord, 0.5
+        )
+
     def test_FDSelect_format_4(self):
         ttx_path = self.getpath("TestFDSelect4.ttx")
         font = TTFont(recalcBBoxes=False, recalcTimestamp=False)
@@ -117,6 +140,27 @@ class CffLibTest(DataFilesHandler):
         font2 = TTFont(save_path)
         glyphOrder = font2.getGlyphOrder()
         self.assertEqual(len(glyphOrder), len(set(glyphOrder)))
+
+    def test_reading_supplement_encoding(self):
+        cff_path = self.getpath("TestSupplementEncoding.cff")
+        topDict = None
+        with open(cff_path, "rb") as fontfile:
+            cff = CFFFontSet()
+            cff.decompile(fontfile, None)
+            topDict = cff[0]
+            self.assertEqual(topDict.Encoding[9], "space")
+            self.assertEqual(topDict.Encoding[32], "space")
+
+
+class CFFToCFF2Test(DataFilesHandler):
+    def test_conversion(self):
+        font_path = self.getpath("CFFToCFF2-1.otf")
+        font = TTFont(font_path)
+        from fontTools.cffLib.CFFToCFF2 import convertCFFToCFF2
+
+        convertCFFToCFF2(font)
+        f = BytesIO()
+        font.save(f)
 
 
 if __name__ == "__main__":

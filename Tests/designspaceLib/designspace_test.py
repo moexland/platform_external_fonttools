@@ -22,6 +22,7 @@ from fontTools.designspaceLib import (
     processRules,
 )
 from fontTools.designspaceLib.types import Range
+from fontTools.misc import etree as ET
 from fontTools.misc import plistlib
 
 from .fixtures import datadir
@@ -919,6 +920,32 @@ def test_documentLib(tmpdir):
     assert new.lib[dummyKey] == dummyData
 
 
+def test_emptyLib(tmpdir):
+    # an empty <lib> element should read as an empty lib, not raise IndexError
+    tmpdir = str(tmpdir)
+    testDocPath = os.path.join(tmpdir, "testEmptyLibTest.designspace")
+    with open(testDocPath, "w", encoding="utf-8") as f:
+        f.write(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<designspace format="4.1">\n'
+            "  <axes>\n"
+            '    <axis tag="TAGA" name="axisName_a" minimum="0" maximum="1000"'
+            ' default="0"/>\n'
+            "  </axes>\n"
+            "  <instances>\n"
+            '    <instance name="instance.a" filename="instance.a.ufo">\n'
+            "      <lib/>\n"
+            "    </instance>\n"
+            "  </instances>\n"
+            "  <lib/>\n"
+            "</designspace>\n"
+        )
+    doc = DesignSpaceDocument()
+    doc.read(testDocPath)
+    assert doc.lib == {}
+    assert doc.instances[0].lib == {}
+
+
 def test_updatePaths(tmpdir):
     doc = DesignSpaceDocument()
     doc.path = str(tmpdir / "foo" / "bar" / "MyDesignspace.designspace")
@@ -1189,3 +1216,236 @@ def test_get_axes(datadir: Path) -> None:
 
     assert ds.getAxis("Width") is ds.getAxisByTag("wdth")
     assert ds.getAxis("Italic") is ds.getAxisByTag("ital")
+
+
+# https://github.com/fonttools/fonttools/issues/4000
+def test_preserveEmptyConditionSet():
+    ds = DesignSpaceDocument()
+    ds.rules = [
+        RuleDescriptor(
+            conditionSets=[{}]  # Empty conditionset (implicit always enabled)
+        ),
+    ]
+
+    ds_str = ds.tostring()
+    assert b"<conditionset/>" in ds_str
+
+    roundtripped_ds = DesignSpaceDocument.fromstring(ds_str)
+    assert len(roundtripped_ds.rules) == 1
+    assert len(roundtripped_ds.rules[0].conditionSets) == 1
+
+
+def test_map_backward_many_to_one():
+    """Test that map_backward handles many-to-one (flat segment) axis maps.
+
+    Regression test for https://github.com/googlefonts/ufo2ft/issues/978
+    """
+    ax = AxisDescriptor()
+    ax.name = "Weight"
+    ax.tag = "wght"
+    ax.minimum = 100
+    ax.default = 100
+    ax.maximum = 1000
+    # Many-to-one: both user=900 and user=1000 map to design=1000
+    ax.map = [
+        (100, 100),
+        (800, 780),
+        (900, 1000),
+        (1000, 1000),
+    ]
+
+    # map_backward(800) should interpolate between (780, 800) and (1000, 900),
+    # NOT between (780, 800) and (1000, 1000).
+    result = ax.map_backward(800)
+    expected = 800 + (800 - 780) / (1000 - 780) * (900 - 800)  # ~809.09
+    assert result == pytest.approx(expected)
+
+
+def test_axis_map_conflicting_duplicate_input_is_rejected_when_consumed():
+    raw_map = [(900, 1000), (400, 450), (100, 100), (400, 500)]
+    original_map = list(raw_map)
+    axis = AxisDescriptor(
+        name="Weight",
+        tag="wght",
+        minimum=100,
+        default=400,
+        maximum=900,
+        # Deliberately out of input order: validation must not depend on
+        # adjacent entries in the source list.
+        map=raw_map,
+    )
+
+    with pytest.raises(
+        DesignSpaceDocumentError,
+        match=r"Axis 'Weight': mapping input value 400 .* 450 and 500",
+    ):
+        axis.map_forward(400)
+    with pytest.raises(DesignSpaceDocumentError, match="Axis 'Weight'"):
+        axis.map_backward(450)
+    assert axis.map is raw_map
+    assert axis.map == original_map
+
+
+def test_axis_map_identical_duplicate_input_is_ignored_by_consumers():
+    raw_map = [(900, 1000), (400, 450), (100, 100), (400, 450)]
+    original_map = list(raw_map)
+    axis = AxisDescriptor(
+        name="Weight",
+        tag="wght",
+        minimum=100,
+        default=400,
+        maximum=900,
+        map=raw_map,
+    )
+
+    assert axis.get_validated_map() == [(900, 1000), (400, 450), (100, 100)]
+    assert axis.map_forward(400) == 450
+    assert axis.map_backward(450) == 400
+    assert axis.map is raw_map
+    assert axis.map == original_map
+
+
+def test_discrete_axis_map_rejects_conflicting_duplicate_inputs_when_consumed():
+    axis = DiscreteAxisDescriptor(
+        name="Style",
+        tag="STYL",
+        values=[0, 1],
+        default=0,
+        map=[(0, 10), (1, 20), (0, 11)],
+    )
+
+    with pytest.raises(DesignSpaceDocumentError, match="Axis 'Style'"):
+        axis.map_forward(0)
+    with pytest.raises(DesignSpaceDocumentError, match="Axis 'Style'"):
+        axis.map_backward(10)
+
+
+def test_parsed_axis_map_conflicting_duplicate_input_is_rejected_when_consumed():
+    designspace = """
+    <designspace format="5.0">
+      <axes>
+        <axis name="Weight" tag="wght" minimum="100" default="400" maximum="900">
+          <map input="900" output="1000"/>
+          <map input="400" output="450"/>
+          <map input="100" output="100"/>
+          <map input="400" output="500"/>
+        </axis>
+      </axes>
+    </designspace>
+    """
+
+    doc = DesignSpaceDocument.fromstring(designspace)
+    raw_map = [(900, 1000), (400, 450), (100, 100), (400, 500)]
+    assert doc.axes[0].map == raw_map
+
+    with pytest.raises(DesignSpaceDocumentError, match="Axis 'Weight'"):
+        doc.axes[0].map_forward(400)
+    assert doc.axes[0].map == raw_map
+
+
+def test_map_backward_many_to_one_mid_range():
+    """Test map_backward with a flat segment in the middle of the axis range."""
+    ax = AxisDescriptor()
+    ax.name = "Weight"
+    ax.tag = "wght"
+    ax.minimum = 100
+    ax.default = 100
+    ax.maximum = 1000
+    # Many-to-one in the middle: both user=400 and user=500 map to design=50
+    ax.map = [
+        (100, 10),
+        (400, 50),
+        (500, 50),
+        (700, 80),
+        (900, 100),
+    ]
+
+    # Before the flat segment: interpolate between (10, 100) and (50, 400)
+    result = ax.map_backward(45)
+    expected = 100 + (45 - 10) / (50 - 10) * (400 - 100)  # 362.5
+    assert result == pytest.approx(expected)
+
+    # After the flat segment: interpolate between (50, 500) and (80, 700)
+    result = ax.map_backward(65)
+    expected = 500 + (65 - 50) / (80 - 50) * (700 - 500)  # 600
+    assert result == pytest.approx(expected)
+
+
+def test_map_backward_many_to_one_at_flat_value():
+    """Test map_backward queried exactly at the flat design value."""
+    ax = AxisDescriptor()
+    ax.name = "Weight"
+    ax.tag = "wght"
+    ax.minimum = 100
+    ax.default = 100
+    ax.maximum = 1000
+    ax.map = [
+        (100, 100),
+        (800, 780),
+        (900, 1000),
+        (1000, 1000),
+    ]
+
+    # map_backward(1000) should return 900 (first user value reaching design=1000)
+    assert ax.map_backward(1000) == 900
+
+    # map_backward(780) should still return 800
+    assert ax.map_backward(780) == 800
+
+
+def test_map_backward_many_to_one_unsorted_input():
+    """Test map_backward with map entries not in user-value order."""
+    ax = AxisDescriptor()
+    ax.name = "Weight"
+    ax.tag = "wght"
+    ax.minimum = 100
+    ax.default = 100
+    ax.maximum = 1000
+    # Same map as the extreme case, but entries shuffled
+    ax.map = [
+        (1000, 1000),
+        (100, 100),
+        (900, 1000),
+        (800, 780),
+    ]
+
+    result = ax.map_backward(800)
+    expected = 800 + (800 - 780) / (1000 - 780) * (900 - 800)  # ~809.09
+    assert result == pytest.approx(expected)
+
+
+def test_map_backward_single_entry():
+    """Test map_backward with a single map entry."""
+    ax = AxisDescriptor()
+    ax.name = "Weight"
+    ax.tag = "wght"
+    ax.minimum = 100
+    ax.default = 100
+    ax.maximum = 1000
+    ax.map = [(100, 200)]
+
+    assert ax.map_backward(200) == 100
+    assert ax.map_backward(300) == 200
+    assert ax.map_backward(100) == 0
+
+
+def test_no_external_entity_expansion(tmp_path):
+    secret = tmp_path / "secret.txt"
+    secret.write_text("s3cr3t")
+    path = tmp_path / "test.designspace"
+    path.write_text(
+        '<?xml version="1.0"?>'
+        '<!DOCTYPE designspace [<!ENTITY xxe SYSTEM "%s">]>'
+        '<designspace format="4.1"><axes>'
+        '<axis tag="wght" name="Weight" minimum="0" maximum="1" default="0">'
+        '<labelname xml:lang="en">x&xxe;</labelname>'
+        "</axis></axes></designspace>" % secret.as_uri()
+    )
+
+    try:
+        doc = DesignSpaceDocument.fromfile(path)
+    except ET.ParseError:
+        # the undefined entity is rejected outright
+        return
+
+    assert "s3cr3t" not in doc.axes[0].labelNames["en"]

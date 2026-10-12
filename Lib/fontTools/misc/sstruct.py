@@ -23,27 +23,27 @@ the number of bits after the point. Fixed point numbers get
 converted to floats.
 
 pack(fmt, object):
-	'object' is either a dictionary or an instance (or actually
-	anything that has a __dict__ attribute). If it is a dictionary,
-	its keys are used for names. If it is an instance, it's
-	attributes are used to grab struct elements from. Returns
-	a string containing the data.
+        'object' is either a dictionary or an instance (or actually
+        anything that has a __dict__ attribute). If it is a dictionary,
+        its keys are used for names. If it is an instance, it's
+        attributes are used to grab struct elements from. Returns
+        a string containing the data.
 
 unpack(fmt, data, object=None)
-	If 'object' is omitted (or None), a new dictionary will be
-	returned. If 'object' is a dictionary, it will be used to add
-	struct elements to. If it is an instance (or in fact anything
-	that has a __dict__ attribute), an attribute will be added for
-	each struct element. In the latter two cases, 'object' itself
-	is returned.
+        If 'object' is omitted (or None), a new dictionary will be
+        returned. If 'object' is a dictionary, it will be used to add
+        struct elements to. If it is an instance (or in fact anything
+        that has a __dict__ attribute), an attribute will be added for
+        each struct element. In the latter two cases, 'object' itself
+        is returned.
 
 unpack2(fmt, data, object=None)
-	Convenience function. Same as unpack, except data may be longer
-	than needed. The returned value is a tuple: (object, leftoverdata).
+        Convenience function. Same as unpack, except data may be longer
+        than needed. The returned value is a tuple: (object, leftoverdata).
 
 calcsize(fmt)
-	like struct.calcsize(), but uses our own fmt strings:
-	it returns the size of the data in bytes.
+        like struct.calcsize(), but uses our own fmt strings:
+        it returns the size of the data in bytes.
 """
 
 from fontTools.misc.fixedTools import fixedToFloat as fi2fl, floatToFixed as fl2fi
@@ -64,7 +64,7 @@ def pack(fmt, obj):
     elements = []
     if not isinstance(obj, dict):
         obj = obj.__dict__
-    for name in names:
+    for name in names.keys():
         value = obj[name]
         if name in fixes:
             # fixed point conversion
@@ -72,6 +72,13 @@ def pack(fmt, obj):
         elif isinstance(value, str):
             value = tobytes(value)
         elements.append(value)
+        # Check it fits
+        try:
+            struct.pack(names[name], value)
+        except Exception as e:
+            raise ValueError(
+                "Value %s does not fit in format %s for %s" % (value, names[name], name)
+            ) from e
     data = struct.pack(*(formatstring,) + tuple(elements))
     return data
 
@@ -86,8 +93,7 @@ def unpack(fmt, data, obj=None):
     else:
         d = obj.__dict__
     elements = struct.unpack(formatstring, data)
-    for i in range(len(names)):
-        name = names[i]
+    for i, name in enumerate(names.keys()):
         value = elements[i]
         if name in fixes:
             # fixed point conversion
@@ -141,7 +147,7 @@ def getformat(fmt, keep_pad_byte=False):
     except KeyError:
         lines = re.split("[\n;]", fmt)
         formatstring = ""
-        names = []
+        names = {}
         fixes = {}
         for line in lines:
             if _emptyRE.match(line):
@@ -158,7 +164,7 @@ def getformat(fmt, keep_pad_byte=False):
                 name = m.group(1)
                 formatchar = m.group(2)
                 if keep_pad_byte or formatchar != "x":
-                    names.append(name)
+                    names[name] = formatchar
                 if m.group(3):
                     # fixed point
                     before = int(m.group(3))
@@ -167,9 +173,10 @@ def getformat(fmt, keep_pad_byte=False):
                     if bits not in [8, 16, 32]:
                         raise Error("fixed point must be 8, 16 or 32 bits long")
                     formatchar = _fixedpointmappings[bits]
+                    names[name] = formatchar
                     assert m.group(5) == "F"
                     fixes[name] = after
-            formatstring = formatstring + formatchar
+            formatstring += formatchar
         _formatcache[fmt] = formatstring, names, fixes
     return formatstring, names, fixes
 

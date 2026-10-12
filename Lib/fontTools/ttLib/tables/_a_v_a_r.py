@@ -1,3 +1,6 @@
+from __future__ import annotations
+
+from typing import Mapping, TYPE_CHECKING
 from fontTools.misc import sstruct
 from fontTools.misc.fixedTools import (
     fixedToFloat as fi2fl,
@@ -6,20 +9,25 @@ from fontTools.misc.fixedTools import (
     strToFixedToFloat as str2fl,
 )
 from fontTools.misc.textTools import bytesjoin, safeEval
+from fontTools.misc.roundTools import otRound
+from fontTools.varLib.models import piecewiseLinearMap
+from fontTools.varLib.varStore import VarStoreInstancer, NO_VARIATION_INDEX
 from fontTools.ttLib import TTLibError
 from . import DefaultTable
 from . import otTables
 import struct
 import logging
 
-
 log = logging.getLogger(__name__)
 
 from .otBase import BaseTTXConverter
 
+if TYPE_CHECKING:
+    from ..ttFont import TTFont
+
 
 class table__a_v_a_r(BaseTTXConverter):
-    """Axis Variations Table
+    """Axis Variations table
 
     This class represents the ``avar`` table of a variable font. The object has one
     substantive attribute, ``segments``, which maps axis tags to a segments dictionary::
@@ -40,6 +48,8 @@ class table__a_v_a_r(BaseTTXConverter):
     ``avar`` segment mapping must contain the entries ``-1.0: -1.0, 0.0: 0.0, 1.0: 1.0``.
     fontTools does not enforce this, so it is your responsibility to ensure that
     mappings are valid.
+
+    See also https://learn.microsoft.com/en-us/typography/opentype/spec/avar
     """
 
     dependencies = ["fvar"]
@@ -74,9 +84,10 @@ class table__a_v_a_r(BaseTTXConverter):
 
     def decompile(self, data, ttFont):
         super().decompile(data, ttFont)
-        assert self.table.Version >= 0x00010000
         self.majorVersion = self.table.Version >> 16
         self.minorVersion = self.table.Version & 0xFFFF
+        if self.majorVersion not in (1, 2):
+            raise NotImplementedError("Unknown avar table version")
         axisTags = [axis.axisTag for axis in ttFont["fvar"].axes]
         for axis in axisTags:
             self.segments[axis] = {}
@@ -136,3 +147,85 @@ class table__a_v_a_r(BaseTTXConverter):
                         segment[fromValue] = toValue
         else:
             super().fromXML(name, attrs, content, ttFont)
+
+    def renormalizeLocation(
+        self, location: Mapping[str, float], font: TTFont, dropZeroes: bool = True
+    ) -> dict[str, float]:
+        majorVersion = getattr(self, "majorVersion", 1)
+
+        if majorVersion not in (1, 2):
+            raise NotImplementedError("Unknown avar table version")
+
+        avarSegments = self.segments
+        mappedLocation = {}
+        for axisTag, value in location.items():
+            avarMapping = avarSegments.get(axisTag, None)
+            if avarMapping is not None:
+                value = piecewiseLinearMap(value, avarMapping)
+            mappedLocation[axisTag] = value
+
+        if majorVersion < 2:
+            return mappedLocation
+
+        # Version 2
+
+        varIdxMap = self.table.VarIdxMap
+        varStore = self.table.VarStore
+        axes = font["fvar"].axes
+        if varStore is not None:
+            varStoreInstancer = VarStoreInstancer(varStore, axes, mappedLocation)
+
+        coords = list(fl2fi(mappedLocation.get(axis.axisTag, 0), 14) for axis in axes)
+
+        out = []
+        for varIdx, v in enumerate(coords):
+            if varIdxMap is not None:
+                varIdx = varIdxMap[varIdx]
+
+            if varStore is not None:
+                delta = varStoreInstancer[varIdx]
+                v += otRound(delta)
+                v = min(max(v, -(1 << 14)), +(1 << 14))
+
+            out.append(v)
+
+        mappedLocation = {
+            axis.axisTag: fi2fl(v, 14)
+            for v, axis in zip(out, axes)
+            if v != 0 or not dropZeroes
+        }
+
+        return mappedLocation
+
+    def renormalizeAxisLimits(self, axisLimits, font=None):
+        """Apply the avar v1 segment maps to normalized axis limits.
+
+        The values of ``axisLimits`` may be (min, default, max) triples or
+        longer sequences whose trailing elements are user-space distances
+        (as in NormalizedAxisTripleAndDistances); only the first three
+        elements are coordinates, so only those are mapped — the distances
+        pass through untouched. The mapped coordinates are quantized to
+        F2Dot14, to avoid surprise interpolations.
+
+        Returns a dict mapping axis tags to tuples of the same length as
+        the input values. avar version 2 mappings are NOT applied — the
+        VarStore-driven part of an avar 2 table is handled separately by
+        the instancer (see fontTools.varLib.instancer).
+        """
+        if getattr(self, "majorVersion", 1) not in (1, 2):
+            raise NotImplementedError("Unknown avar table version")
+
+        avarSegments = self.segments
+        mappedAxisLimits = {}
+        for axisTag, triple in axisLimits.items():
+            coords = tuple(triple)[:3]
+            distances = tuple(triple)[3:]
+            avarMapping = avarSegments.get(axisTag, None)
+            if avarMapping is not None:
+                coords = tuple(
+                    piecewiseLinearMap(value, avarMapping) for value in coords
+                )
+            # Quantize to F2Dot14, to avoid surprise interpolations.
+            coords = tuple(fi2fl(fl2fi(value, 14), 14) for value in coords)
+            mappedAxisLimits[axisTag] = coords + distances
+        return mappedAxisLimits

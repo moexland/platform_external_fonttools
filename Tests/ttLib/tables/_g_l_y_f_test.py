@@ -1,4 +1,5 @@
 from fontTools.misc.fixedTools import otRound
+from fontTools.misc.roundTools import noRound
 from fontTools.misc.testTools import getXML, parseXML
 from fontTools.misc.transform import Transform
 from fontTools.pens.ttGlyphPen import TTGlyphPen
@@ -22,8 +23,10 @@ from fontTools.ttLib.tables._g_l_y_f import (
 from fontTools.ttLib.tables import ttProgram
 import sys
 import array
+from collections.abc import ValuesView, ItemsView
 from copy import deepcopy
 from io import StringIO, BytesIO
+from pathlib import Path
 import itertools
 import pytest
 import re
@@ -75,7 +78,6 @@ class GlyphCoordinatesTest(object):
         g2 = -g
         assert g2 == GlyphCoordinates([(-1, -2)])
 
-    @pytest.mark.skipif(sys.version_info[0] < 3, reason="__round___ requires Python 3")
     def test__round__(self):
         g = GlyphCoordinates([(-1.5, 2)])
         g2 = round(g)
@@ -270,6 +272,67 @@ class GlyfTableTest(unittest.TestCase):
         ):
             glyph_A.getCoordinates(glyphSet)
 
+    def _makeComponentGlyph(self, glyphSet, name, ref, dx, dy):
+        pen = TTGlyphPen(glyphSet)
+        pen.addComponent(ref, (1, 0, 0, 1, dx, dy))
+        glyphSet[name] = pen.glyph()
+
+    def test_recalcBounds_recursiveComponent(self):
+        # Integer-translate-only components take the fast path
+        # (tryRecalcBoundsComposite); a recursive reference there must raise
+        # TTLibError just like the getCoordinates slow path, rather than let a
+        # raw RecursionError escape.
+        # https://github.com/fonttools/fonttools/issues/3899
+        # A -> B -> A cycle, all plain integer translates.
+        glyphSet = {}
+        glyphSet["A"] = glyphSet["B"] = TTGlyphPen(glyphSet).glyph()
+        self._makeComponentGlyph(glyphSet, "A", "B", 10, 0)
+        self._makeComponentGlyph(glyphSet, "B", "A", 0, 10)
+        # sanity check that this exercises the integer-translate fast path
+        self.assertTrue(glyphSet["A"].components[0]._hasOnlyIntegerTranslate())
+        with self.assertRaisesRegex(
+            TTLibError, "glyph '.' contains a recursive component reference"
+        ):
+            glyphSet["A"].recalcBounds(glyphSet)
+        # and via the boundsDone set that table__g_l_y_f.compile() passes
+        with self.assertRaisesRegex(
+            TTLibError, "glyph '.' contains a recursive component reference"
+        ):
+            glyphSet["A"].recalcBounds(glyphSet, boundsDone=set())
+
+    def test_recalcBounds_selfReferencingComponent(self):
+        glyphSet = {}
+        glyphSet["A"] = TTGlyphPen(glyphSet).glyph()
+        self._makeComponentGlyph(glyphSet, "A", "A", 5, 5)
+        with self.assertRaisesRegex(
+            TTLibError, "glyph 'A' contains a recursive component reference"
+        ):
+            glyphSet["A"].recalcBounds(glyphSet)
+
+    def test_recalcBounds_acyclicComposite(self):
+        # A valid acyclic integer-translate composite must still compute the
+        # correct bounds (the recursion guard must not affect normal glyphs).
+        glyphSet = {}
+        pen = TTGlyphPen(glyphSet)
+        pen.moveTo((5, 5))
+        pen.lineTo((10, 10))
+        pen.lineTo((10, 5))
+        pen.lineTo((5, 5))
+        pen.closePath()
+        glyphSet["base"] = pen.glyph()
+        self._makeComponentGlyph(glyphSet, "A", "base", 100, 200)
+        glyphSet["base"].recalcBounds(glyphSet)
+        glyphSet["A"].recalcBounds(glyphSet, boundsDone=set())
+        self.assertEqual(
+            (
+                glyphSet["A"].xMin,
+                glyphSet["A"].yMin,
+                glyphSet["A"].xMax,
+                glyphSet["A"].yMax,
+            ),
+            (105, 205, 110, 210),
+        )
+
     def test_trim_remove_hinting_composite_glyph(self):
         glyphSet = {"dummy": TTGlyphPen(None).glyph()}
 
@@ -419,6 +482,59 @@ class GlyfTableTest(unittest.TestCase):
         del glyf["b"]
         assert glyf.getGlyphID("c") == 2
 
+    # __setitem__ uses the reverse glyph map for O(1) membership; the tests below
+    # check it keeps glyphOrder and the reverse map consistent across the
+    # supported paths.
+
+    def test_setitem_prepopulated_glyphOrder_no_duplicate(self):
+        # with glyphOrder already populated, assigning a glyph by an
+        # already-listed name must not re-append it to glyphOrder.
+        glyf = newTable("glyf")
+        glyf.glyphs = {}
+        glyf.glyphOrder = [".notdef", "a", "b"]
+        for name in list(glyf.glyphOrder):
+            glyf[name] = Glyph()
+        assert glyf.glyphOrder == [".notdef", "a", "b"]
+        assert glyf.getGlyphID("b") == 2
+
+    def test_setitem_appends_new_glyph(self):
+        # assigning a name that isn't in glyphOrder appends it and resolves
+        glyf = newTable("glyf")
+        glyf.glyphs = {}
+        glyf.glyphOrder = [".notdef", "a"]
+        for name in list(glyf.glyphOrder):
+            glyf[name] = Glyph()
+        glyf["b"] = Glyph()
+        assert glyf.glyphOrder == [".notdef", "a", "b"]
+        assert glyf.getGlyphID("b") == 2
+
+    def test_setitem_after_setGlyphOrder_reorder(self):
+        # reordering through the public setGlyphOrder clears the reverse map, so
+        # re-assigning an already-listed glyph afterwards must not duplicate it
+        glyf = newTable("glyf")
+        glyf.glyphs = {}
+        glyf.glyphOrder = [".notdef", "a", "b"]
+        for name in list(glyf.glyphOrder):
+            glyf[name] = Glyph()
+        glyf.setGlyphOrder(["b", "a", ".notdef"])
+        glyf["a"] = Glyph()
+        assert glyf.glyphOrder == ["b", "a", ".notdef"]
+        assert glyf.getGlyphID("a") == 1
+
+    def test_setitem_after_delitem(self):
+        # deletion invalidates the reverse map and shifts later ids; a following
+        # assignment must still keep glyphOrder and the map consistent
+        glyf = newTable("glyf")
+        glyf.glyphs = {}
+        glyf.glyphOrder = [".notdef", "a", "b"]
+        for name in list(glyf.glyphOrder):
+            glyf[name] = Glyph()
+        del glyf["a"]
+        assert glyf.glyphOrder == [".notdef", "b"]
+        glyf["c"] = Glyph()
+        assert glyf.glyphOrder == [".notdef", "b", "c"]
+        assert glyf.getGlyphID("c") == 2
+
 
 class GlyphTest:
     def test_getCoordinates(self):
@@ -538,6 +654,37 @@ class GlyphTest:
             ]
         )
 
+    def test_get_components_nested(self):
+        # check that getCoordinates will correctly round with nested
+        glyphSet = {}
+
+        pen = TTGlyphPen(glyphSet)
+        pen.moveTo((372, 736))
+        pen.lineTo((68, 426))
+        pen.qCurveTo((68.0, 426.0), (64.25, 414.0), (62.5, 386.25), (64.0, 372.0))
+        pen.lineTo((0, 100))
+        pen.lineTo((372, 736))
+        pen.closePath()
+
+        # turn off rounding here; we're pretending that this glyph has been
+        # through cubic->quadratic conversion, which introduced some floats
+        glyphSet["base"] = pen.glyph(round=noRound)
+
+        pen = TTGlyphPen(glyphSet)
+        # this is a simple translation
+        pen.addComponent("base", (1, 0, 0, 1, 10, 10))
+        glyphSet["simpleXform"] = pen.glyph()
+
+        pen = TTGlyphPen(glyphSet)
+        # this is flipped on the y axis
+        pen.addComponent("simpleXform", (-1, 0, 0, -1, 834, 793))
+        glyphSet["nestedTrickyXForm"] = trickyXForm = pen.glyph()
+
+        coords, _, _ = trickyXForm.getCoordinates(glyphSet, round=otRound)
+        assert all(
+            (int(p[0]), int(p[1])) == p for p in coords
+        ), f"{[p for p in coords]}"
+
     def test_getCompositeMaxpValues(self):
         # https://github.com/fonttools/fonttools/issues/2044
         glyphSet = {}
@@ -567,17 +714,75 @@ class GlyphTest:
         pen = TTGlyphPen(glyphSet)
         # empty simple glyph
         foo = glyphSet["foo"] = pen.glyph()
+
+        pen.moveTo((5, 5))
+        pen.lineTo((10, 10))
+        pen.lineTo((10, 5))
+        pen.lineTo((5, 5))
+        pen.closePath()
+
+        # non-empty simple glyph
+        doo = glyphSet["doo"] = pen.glyph()
+
+        pen = TTGlyphPen(glyphSet)
         # use the empty 'foo' glyph as a component in 'bar' with some x/y offsets
         pen.addComponent("foo", (1, 0, 0, 1, -80, 50))
+        # and use the non-empty 'doo' glyph at origin
+        pen.addComponent("doo", (1, 0, 0, 1, 0, 0))
         bar = glyphSet["bar"] = pen.glyph()
 
         foo.recalcBounds(glyphSet)
+        doo.recalcBounds(glyphSet)
         bar.recalcBounds(glyphSet)
 
-        # we expect both the empty simple glyph and the composite referencing it
-        # to have empty bounding boxes (0, 0, 0, 0) no matter the component's shift
         assert (foo.xMin, foo.yMin, foo.xMax, foo.yMax) == (0, 0, 0, 0)
-        assert (bar.xMin, bar.yMin, bar.xMax, bar.yMax) == (0, 0, 0, 0)
+        assert (doo.xMin, doo.yMin, doo.xMax, doo.yMax) == (5, 5, 10, 10)
+        # the composite should have bounds identical to 'doo';
+        # the empty foo glyph should do nothing
+        assert (bar.xMin, bar.yMin, bar.xMax, bar.yMax) == (5, 5, 10, 10)
+
+    def test_recalcBounds_empty_components_nested(self):
+        # this differs from the above in an important way: it has a 'foofoo'
+        # glyph, which is a composite glyph, where none of its components
+        # have any contours; we want to check that when this glyph is referenced
+        # it is also treated as not contributing to the parent's bounds.
+
+        glyphSet = {}
+        pen = TTGlyphPen(glyphSet)
+        # empty simple glyph
+        foo = glyphSet["foo"] = pen.glyph()
+
+        pen.addComponent("foo", (1, 0, 0, 1, 20, 20))
+        foofoo = glyphSet["foofoo"] = pen.glyph()
+
+        pen = TTGlyphPen(glyphSet)
+
+        pen.moveTo((5, 5))
+        pen.lineTo((10, 10))
+        pen.lineTo((10, 5))
+        pen.lineTo((5, 5))
+        pen.closePath()
+
+        # non-empty simple glyph
+        doo = glyphSet["doo"] = pen.glyph()
+
+        pen = TTGlyphPen(glyphSet)
+        # use the empty 'foo' glyph as a component in 'bar' with some x/y offsets
+        pen.addComponent("foofoo", (1, 0, 0, 1, 0, 0))
+        # and use the non-empty 'doo' glyph at origin
+        pen.addComponent("doo", (1, 0, 0, 1, 0, 0))
+        bar = glyphSet["bar"] = pen.glyph()
+
+        foo.recalcBounds(glyphSet)
+        foofoo.recalcBounds(glyphSet)
+        doo.recalcBounds(glyphSet)
+        bar.recalcBounds(glyphSet)
+
+        assert (foo.xMin, foo.yMin, foo.xMax, foo.yMax) == (0, 0, 0, 0)
+        assert (doo.xMin, doo.yMin, doo.xMax, doo.yMax) == (5, 5, 10, 10)
+        # the composite should have bounds identical to 'doo';
+        # the empty foo glyph should do nothing
+        assert (bar.xMin, bar.yMin, bar.xMax, bar.yMax) == (5, 5, 10, 10)
 
 
 class GlyphComponentTest:
@@ -707,6 +912,37 @@ class GlyphComponentTest:
             '<component glyphName="a" firstPt="1" secondPt="2" flags="0x0"/>'
         ]
 
+    def test_compile_for_speed(self):
+        glyph = Glyph()
+        glyph.numberOfContours = 1
+        glyph.coordinates = GlyphCoordinates(
+            [(0, 0), (1, 0), (1, 0), (1, 1), (1, 1), (0, 1), (0, 1)]
+        )
+        glyph.flags = array.array("B", [flagOnCurve] + [flagCubic] * 6)
+        glyph.endPtsOfContours = [6]
+        glyph.program = ttProgram.Program()
+
+        glyph.expand(None)
+        sizeBytes = glyph.compile(None, optimizeSize=True)
+        glyph.expand(None)
+        speedBytes = glyph.compile(None, optimizeSize=False)
+
+        assert len(sizeBytes) < len(speedBytes)
+
+        for data in sizeBytes, speedBytes:
+            glyph = Glyph(data)
+
+            pen = RecordingPen()
+            glyph.draw(pen, None)
+
+            assert pen.value == [
+                ("moveTo", ((0, 0),)),
+                ("curveTo", ((1, 0), (1, 0), (1.0, 0.5))),
+                ("curveTo", ((1, 1), (1, 1), (0.5, 1.0))),
+                ("curveTo", ((0, 1), (0, 1), (0, 0))),
+                ("closePath", ()),
+            ]
+
     def test_fromXML_reference_points(self):
         comp = GlyphComponent()
         for name, attrs, content in parseXML(
@@ -719,64 +955,83 @@ class GlyphComponentTest:
         assert (comp.firstPt, comp.secondPt) == (1, 2)
         assert not hasattr(comp, "transform")
 
-    def test_trim_varComposite_glyph(self):
-        font_path = os.path.join(DATA_DIR, "..", "..", "data", "varc-ac00-ac01.ttf")
-        font = TTFont(font_path)
-        glyf = font["glyf"]
-
-        glyf.glyphs["uniAC00"].trim()
-        glyf.glyphs["uniAC01"].trim()
-
-        font_path = os.path.join(DATA_DIR, "..", "..", "data", "varc-6868.ttf")
-        font = TTFont(font_path)
-        glyf = font["glyf"]
-
-        glyf.glyphs["uni6868"].trim()
-
-    def test_varComposite_basic(self):
-        font_path = os.path.join(DATA_DIR, "..", "..", "data", "varc-ac00-ac01.ttf")
-        font = TTFont(font_path)
-        tables = [
-            table_tag
-            for table_tag in font.keys()
-            if table_tag not in {"head", "maxp", "hhea"}
+    def test_items(self):
+        glyf = newTable("glyf")
+        glyf.glyphs = {}
+        glyf.glyphOrder = [".notdef", "a", "b"]
+        for name in glyf.glyphOrder:
+            glyf[name] = Glyph()
+        assert isinstance(glyf.items(), ItemsView)
+        items = list(glyf.items())
+        assert items == [
+            (".notdef", glyf[".notdef"]),
+            ("a", glyf["a"]),
+            ("b", glyf["b"]),
         ]
-        xml = StringIO()
-        font.saveXML(xml)
-        xml1 = StringIO()
-        font.saveXML(xml1, tables=tables)
-        xml.seek(0)
-        font = TTFont()
-        font.importXML(xml)
-        ttf = BytesIO()
-        font.save(ttf)
-        ttf.seek(0)
-        font = TTFont(ttf)
-        xml2 = StringIO()
-        font.saveXML(xml2, tables=tables)
-        assert xml1.getvalue() == xml2.getvalue()
 
-        font_path = os.path.join(DATA_DIR, "..", "..", "data", "varc-6868.ttf")
-        font = TTFont(font_path)
-        tables = [
-            table_tag
-            for table_tag in font.keys()
-            if table_tag not in {"head", "maxp", "hhea", "name", "fvar"}
+    def test_items_lazy(self):
+        font = TTFont(
+            Path(__file__).parent.parent.parent / "ttx" / "data" / "TestTTF.ttf",
+            lazy=True,
+        )
+        glyf = font["glyf"]
+        assert isinstance(glyf.items(), ItemsView)
+        items = list(glyf.items())
+        assert items[0][1].numberOfContours == 2  # .notdef
+        assert items == [
+            (".notdef", glyf[".notdef"]),
+            (".null", glyf[".null"]),
+            ("CR", glyf["CR"]),
+            ("space", glyf["space"]),
+            ("period", glyf["period"]),
+            ("ellipsis", glyf["ellipsis"]),
         ]
-        xml = StringIO()
-        font.saveXML(xml)
-        xml1 = StringIO()
-        font.saveXML(xml1, tables=tables)
-        xml.seek(0)
-        font = TTFont()
-        font.importXML(xml)
-        ttf = BytesIO()
-        font.save(ttf)
-        ttf.seek(0)
-        font = TTFont(ttf)
-        xml2 = StringIO()
-        font.saveXML(xml2, tables=tables)
-        assert xml1.getvalue() == xml2.getvalue()
+
+    def test_iter(self):
+        glyf = newTable("glyf")
+        glyf.glyphs = {}
+        glyf.glyphOrder = [".notdef", "a", "b"]
+        for name in glyf.glyphOrder:
+            glyf[name] = Glyph()
+        names = [name for name in glyf]
+        assert names == [".notdef", "a", "b"]
+
+    def test_iter_lazy(self):
+        font = TTFont(
+            Path(__file__).parent.parent.parent / "ttx" / "data" / "TestTTF.ttf",
+            lazy=True,
+        )
+        glyf = font["glyf"]
+        names = [name for name in glyf]
+        assert names == [".notdef", ".null", "CR", "space", "period", "ellipsis"]
+
+    def test_values(self):
+        glyf = newTable("glyf")
+        glyf.glyphs = {}
+        glyf.glyphOrder = [".notdef", "a", "b"]
+        for name in glyf.glyphOrder:
+            glyf[name] = Glyph()
+        assert isinstance(glyf.values(), ValuesView)
+        glyphs = list(glyf.values())
+        assert glyphs == [glyf[".notdef"], glyf["a"], glyf["b"]]
+
+    def test_values_lazy(self):
+        font = TTFont(
+            Path(__file__).parent.parent.parent / "ttx" / "data" / "TestTTF.ttf",
+            lazy=True,
+        )
+        glyf = font["glyf"]
+        assert isinstance(glyf.values(), ValuesView)
+        glyphs = list(glyf.values())
+        assert glyphs[0].numberOfContours == 2  # .notdef
+        assert glyphs == [
+            glyf[".notdef"],
+            glyf[".null"],
+            glyf["CR"],
+            glyf["space"],
+            glyf["period"],
+            glyf["ellipsis"],
+        ]
 
 
 class GlyphCubicTest:

@@ -212,6 +212,17 @@ class BuilderTest(object):
             "</Coverage>",
         ]
 
+    def test_buildCoverage_empty(self):
+        # Empty coverage should return an empty Coverage, not None.
+        # https://github.com/fonttools/fonttools/issues/4003
+        cov = builder.buildCoverage([], {"two": 2, "four": 4})
+        assert cov is not None
+        assert cov.glyphs == []
+        assert getXML(cov.toXML) == [
+            "<Coverage>",
+            "</Coverage>",
+        ]
+
     def test_buildCursivePos(self):
         pos = builder.buildCursivePosSubtable(
             {"two": (self.ANCHOR1, self.ANCHOR2), "four": (self.ANCHOR3, self.ANCHOR1)},
@@ -681,6 +692,25 @@ class BuilderTest(object):
 
     def test_buildMarkGlyphSetsDef_None(self):
         assert builder.buildMarkGlyphSetsDef(None, self.GLYPHMAP) is None
+
+    def test_buildMarkGlyphSetsDef_emptyMarkSet(self):
+        # Empty mark sets should produce an empty Coverage, not None/null offset.
+        # https://github.com/fonttools/fonttools/issues/4003
+        marksets = builder.buildMarkGlyphSetsDef(
+            [{"acute", "grave"}, set()], self.GLYPHMAP
+        )
+        assert getXML(marksets.toXML) == [
+            "<MarkGlyphSetsDef>",
+            '  <MarkSetTableFormat value="1"/>',
+            "  <!-- MarkSetCount=2 -->",
+            '  <Coverage index="0">',
+            '    <Glyph value="grave"/>',
+            '    <Glyph value="acute"/>',
+            "  </Coverage>",
+            '  <Coverage index="1">',
+            "  </Coverage>",
+            "</MarkGlyphSetsDef>",
+        ]
 
     def test_buildMarkLigPosSubtable(self):
         anchor = builder.buildAnchor
@@ -1854,6 +1884,29 @@ def test_buildMathTable_horizAssembly():
 
 
 class ChainContextualRulesetTest(object):
+    @pytest.mark.parametrize(
+        "builder_class",
+        [builder.ChainContextPosBuilder, builder.ChainContextSubstBuilder],
+    )
+    @pytest.mark.parametrize("extension", [False, True])
+    def test_format2_overflow_falls_back_to_format3(self, builder_class, extension):
+        font = ttLib.TTFont()
+        glyphs = [f"g{i}" for i in range(44000)]
+        font.setGlyphOrder(glyphs)
+        lookup_builder = builder_class(font, None)
+        lookup_builder.extension = extension
+        # Alternating glyph IDs make the format-2 ClassDef too large, while
+        # the equivalent format-3 Coverage fits in a single subtable.
+        lookup_builder.rules.append(
+            builder.ChainContextualRule([], [glyphs[::2]], [], [None])
+        )
+        lookup = lookup_builder.build()
+        assert len(lookup.SubTable) == 1
+        subtable = lookup.SubTable[0]
+        if extension:
+            subtable = subtable.ExtSubTable
+        assert subtable.Format == 3
+
     def test_makeRulesets(self):
         font = ttLib.TTFont()
         font.setGlyphOrder(["a", "b", "c", "d", "A", "B", "C", "D", "E"])

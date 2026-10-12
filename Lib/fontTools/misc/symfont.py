@@ -76,16 +76,16 @@ class GreenPen(BasePen):
         self.value = 0
 
     def _moveTo(self, p0):
-        self.__startPoint = p0
+        self._startPoint = p0
 
     def _closePath(self):
         p0 = self._getCurrentPoint()
-        if p0 != self.__startPoint:
-            self._lineTo(self.__startPoint)
+        if p0 != self._startPoint:
+            self._lineTo(self._startPoint)
 
     def _endPath(self):
         p0 = self._getCurrentPoint()
-        if p0 != self.__startPoint:
+        if p0 != self._startPoint:
             # Green theorem is not defined on open contours.
             raise NotImplementedError
 
@@ -121,13 +121,10 @@ def printGreenPen(penName, funcs, file=sys.stdout, docstring=None):
         """from fontTools.pens.basePen import BasePen, OpenContourError
 try:
 	import cython
-
-	COMPILED = cython.compiled
 except (AttributeError, ImportError):
 	# if cython not installed, use mock module with no-op decorators and types
 	from fontTools.misc import cython
-
-	COMPILED = False
+COMPILED = cython.compiled
 
 
 __all__ = ["%s"]
@@ -136,8 +133,7 @@ class %s(BasePen):
 
 	def __init__(self, glyphset=None):
 		BasePen.__init__(self, glyphset)
-"""
-        % (penName, penName),
+""" % (penName, penName),
         file=file,
     )
     for name, f in funcs:
@@ -145,19 +141,18 @@ class %s(BasePen):
     print(
         """
 	def _moveTo(self, p0):
-		self.__startPoint = p0
+		self._startPoint = p0
 
 	def _closePath(self):
 		p0 = self._getCurrentPoint()
-		if p0 != self.__startPoint:
-			self._lineTo(self.__startPoint)
+		if p0 != self._startPoint:
+			self._lineTo(self._startPoint)
 
 	def _endPath(self):
 		p0 = self._getCurrentPoint()
-		if p0 != self.__startPoint:
-			# Green theorem is not defined on open contours.
+		if p0 != self._startPoint:
 			raise OpenContourError(
-							"Green theorem is not defined on open contours."
+							"Glyph statistics is not defined on open contours."
 			)
 """,
         end="",
@@ -228,8 +223,7 @@ class %s(BasePen):
         """
 if __name__ == '__main__':
 	from fontTools.misc.symfont import x, y, printGreenPen
-	printGreenPen('%s', ["""
-        % penName,
+	printGreenPen('%s', [""" % penName,
         file=file,
     )
     for name, f in funcs:
@@ -238,11 +232,9 @@ if __name__ == '__main__':
 
 
 if __name__ == "__main__":
-    pen = AreaPen()
-    pen.moveTo((100, 100))
-    pen.lineTo((100, 200))
-    pen.lineTo((200, 200))
-    pen.curveTo((200, 250), (300, 300), (250, 350))
-    pen.lineTo((200, 100))
-    pen.closePath()
-    print(pen.value)
+    import sys
+
+    if sys.argv[1:]:
+        penName = sys.argv[1]
+        funcs = [(name, eval(f)) for name, f in zip(sys.argv[2::2], sys.argv[3::2])]
+        printGreenPen(penName, funcs, file=sys.stdout)

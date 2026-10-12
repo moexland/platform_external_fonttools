@@ -8,6 +8,7 @@ from os.path import isfile, join as pjoin
 from glob import glob
 from setuptools import setup, find_packages, Command, Extension
 from setuptools.command.build_ext import build_ext as _build_ext
+from setuptools.errors import SetupError
 from distutils import log
 from distutils.util import convert_path
 import subprocess as sp
@@ -33,7 +34,7 @@ if {"bdist_wheel"}.intersection(sys.argv):
     setup_requires.append("wheel")
 
 if {"release"}.intersection(sys.argv):
-    setup_requires.append("bump2version")
+    setup_requires.extend(["bump2version", "readme_renderer"])
 
 try:
     __import__("cython")
@@ -68,17 +69,40 @@ if with_cython and not has_cython:
 
 ext_modules = []
 if with_cython is True or (with_cython is None and has_cython):
+    # On POSIX systems (Linux, macOS, etc.), math functions like sqrt, pow, fabs
+    # may require explicit linkage to libm. This is particularly needed on some
+    # Linux distributions (e.g., Amazon Linux with Clang) where libm is not
+    # automatically linked. On Windows, math functions are in msvcrt.
+    # See https://github.com/fonttools/fonttools/issues/4028
+    libraries = ["m"] if os.name == "posix" else []
+
     ext_modules.append(
-        Extension("fontTools.cu2qu.cu2qu", ["Lib/fontTools/cu2qu/cu2qu.py"]),
+        Extension(
+            "fontTools.cu2qu.cu2qu",
+            ["Lib/fontTools/cu2qu/cu2qu.py"],
+            libraries=libraries,
+        ),
     )
     ext_modules.append(
-        Extension("fontTools.qu2cu.qu2cu", ["Lib/fontTools/qu2cu/qu2cu.py"]),
+        Extension(
+            "fontTools.qu2cu.qu2cu",
+            ["Lib/fontTools/qu2cu/qu2cu.py"],
+            libraries=libraries,
+        ),
     )
     ext_modules.append(
-        Extension("fontTools.misc.bezierTools", ["Lib/fontTools/misc/bezierTools.py"]),
+        Extension(
+            "fontTools.misc.bezierTools",
+            ["Lib/fontTools/misc/bezierTools.py"],
+            libraries=libraries,
+        ),
     )
     ext_modules.append(
-        Extension("fontTools.pens.momentsPen", ["Lib/fontTools/pens/momentsPen.py"]),
+        Extension(
+            "fontTools.pens.momentsPen",
+            ["Lib/fontTools/pens/momentsPen.py"],
+            libraries=libraries,
+        ),
     )
     ext_modules.append(
         Extension("fontTools.varLib.iup", ["Lib/fontTools/varLib/iup.py"]),
@@ -88,9 +112,12 @@ if with_cython is True or (with_cython is None and has_cython):
     )
 
 extras_require = {
-    # for fontTools.ufoLib: to read/write UFO fonts
+    # for fontTools.ufoLib: to read/write UFO fonts (kept for backwards compatibility).
+    # NOTE: pyfilesystem2 is no longer maintained though it may still continue to work
+    # with fontTools.ufoLib for a while; however we no longer depend on it, and instead
+    # maintain our own drop-in replacement in fontTools.misc.filesystem.
     "ufo": [
-        "fs >= 2.2.0, < 3",
+        # "fs >= 2.2.0, < 3",
     ],
     # for fontTools.misc.etree and fontTools.misc.plistlib: use lxml to
     # read/write XML files (faster/safer than built-in ElementTree)
@@ -108,7 +135,7 @@ extras_require = {
     # of the Unicode Character Database instead of the built-in unicodedata
     # which varies between python versions and may be outdated.
     "unicode": [
-        ("unicodedata2 >= 15.1.0; python_version <= '3.12'"),
+        "unicodedata2 >= 18.0.0; python_version <= '3.15'",
     ],
     # for graphite type tables in ttLib/tables (Silf, Glat, Gloc)
     "graphite": ["lz4 >= 1.7.4.2"],
@@ -142,7 +169,7 @@ extras_require = {
     ],
     # for packing GSUB/GPOS tables with Harfbuzz repacker
     "repacker": [
-        "uharfbuzz >= 0.23.0",
+        "uharfbuzz >= 0.45.0",
     ],
 }
 # use a special 'all' key as shorthand to includes all the extra dependencies
@@ -157,15 +184,14 @@ classifiers = {
         "Environment :: Other Environment",
         "Intended Audience :: Developers",
         "Intended Audience :: End Users/Desktop",
-        "License :: OSI Approved :: MIT License",
         "Natural Language :: English",
         "Operating System :: OS Independent",
         "Programming Language :: Python",
-        "Programming Language :: Python :: 3.8",
-        "Programming Language :: Python :: 3.9",
-        "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
+        "Programming Language :: Python :: 3.14",
+        "Programming Language :: Python :: 3.15",
         "Programming Language :: Python :: 3",
         "Topic :: Text Processing :: Fonts",
         "Topic :: Multimedia :: Graphics",
@@ -179,8 +205,21 @@ classifiers = {
 with io.open("README.rst", "r", encoding="utf-8") as readme:
     long_description = readme.read()
 long_description += "\nChangelog\n~~~~~~~~~\n\n"
+# At the same time, we don't want the PyPI package description becoming too
+# long (some tools like Azure DevOps impose maximum length of 324KB) so we
+# trim it when we see a special rst comment
+changelog_limit_re = re.compile(r"^\.\. package description limit")
 with io.open("NEWS.rst", "r", encoding="utf-8") as changelog:
-    long_description += changelog.read()
+    short_changelog = []
+    for line in changelog:
+        if changelog_limit_re.match(line):
+            break
+        short_changelog.append(line)
+short_changelog.append(
+    "\\... see `here <https://github.com/fonttools/fonttools/blob/main/NEWS.rst>`__ "
+    "for earlier changes\n"
+)
+long_description += "".join(short_changelog)
 
 
 @contextlib.contextmanager
@@ -266,7 +305,19 @@ class release(Command):
             raise DistutilsOptionError("--major/--minor are mutually exclusive")
         self.part = "major" if self.major else "minor" if self.minor else None
 
+    def check_long_description_syntax(self):
+        import readme_renderer.rst
+
+        result = readme_renderer.rst.render(long_description, stream=sys.stderr)
+        if result is None:
+            raise SetupError(
+                "`long_description` has syntax errors in markup"
+                " and would not be rendered on PyPI."
+            )
+
     def run(self):
+        self.check_long_description_syntax()
+
         if self.part is not None:
             log.info("bumping '%s' version" % self.part)
             self.bumpversion(self.part, commit=False)
@@ -425,16 +476,20 @@ class cython_build_ext(_build_ext):
         # optionally enable line tracing for test coverage support
         linetrace = os.environ.get("CYTHON_TRACE") == "1"
 
+        directives = {
+            "linetrace": linetrace,
+            "language_level": 3,
+            "embedsignature": True,
+        }
+        if sys.version_info >= (3, 13):
+            directives["freethreading_compatible"] = True
+
         self.distribution.ext_modules[:] = cythonize(
             self.distribution.ext_modules,
             force=linetrace or self.force,
             annotate=os.environ.get("CYTHON_ANNOTATE") == "1",
             quiet=not self.verbose,
-            compiler_directives={
-                "linetrace": linetrace,
-                "language_level": 3,
-                "embedsignature": True,
-            },
+            compiler_directives=directives,
         )
 
         _build_ext.finalize_options(self)
@@ -468,7 +523,7 @@ if ext_modules:
 
 setup_params = dict(
     name="fonttools",
-    version="4.49.0",
+    version="4.66.1",
     description="Tools to manipulate font files",
     author="Just van Rossum",
     author_email="just@letterror.com",
@@ -476,9 +531,11 @@ setup_params = dict(
     maintainer_email="behdad@behdad.org",
     url="http://github.com/fonttools/fonttools",
     license="MIT",
+    license_files=["LICENSE", "LICENSE.external"],
     platforms=["Any"],
-    python_requires=">=3.8",
+    python_requires=">=3.11",
     long_description=long_description,
+    long_description_content_type="text/x-rst",
     package_dir={"": "Lib"},
     packages=find_packages("Lib"),
     include_package_data=True,

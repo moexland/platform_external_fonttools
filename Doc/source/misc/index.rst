@@ -2,11 +2,17 @@
 misc: Miscellaneous libraries helpful for font engineering
 ##########################################################
 
-This is a collection of packages, most of which are used as internal support
-utilities by fontTools, but some of which may be more generally useful.
+.. currentmodule:: fontTools.misc
+
+.. rubric:: Overview:
+   :heading-level: 2
+
+:mod:`fontTools.misc` is a collection of modules, most of which are
+used as internal support utilities by fontTools, but some of which may
+be more generally useful.
 
 .. toctree::
-   :maxdepth: 2
+   :maxdepth: 1
 
    arrayTools
    bezierTools
@@ -26,11 +32,13 @@ utilities by fontTools, but some of which may be more generally useful.
    psCharStrings
    psLib
    psOperators
+   roundTools
    sstruct
    symfont
    testTools
    textTools
    timeTools
    transform
+   visitor
    xmlReader
    xmlWriter

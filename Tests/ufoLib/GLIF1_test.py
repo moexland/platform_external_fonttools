@@ -300,11 +300,27 @@ class TestGLIF1(unittest.TestCase):
         self.assertRaises(GlifLibError, self.pyToGLIF, py)
         self.assertRaises(GlifLibError, self.glifToPy, glif)
 
+    def testUnicodes_hex_present(self):
+        """Test that a present <unicode> element must have a
+        'hex' attribute; by testing that an invalid <unicode>
+        element raises an appropriate error.
+        """
+
+        # illegal
+        glif = """
+		<glyph name="a" format="1">
+			<unicode />
+			<outline>
+			</outline>
+		</glyph>
+		"""
+        self.assertRaises(GlifLibError, self.glifToPy, glif)
+
     def testNote(self):
         glif = """
 		<glyph name="a" format="1">
 			<note>
-				\U0001F4A9
+				\U0001f4a9
 			</note>
 			<outline>
 			</outline>

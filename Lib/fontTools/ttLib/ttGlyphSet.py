@@ -3,17 +3,38 @@
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from contextlib import contextmanager
-from copy import copy
+from copy import copy, deepcopy
 from types import SimpleNamespace
-from fontTools.misc.fixedTools import otRound
+from fontTools.misc.vector import Vector
+from fontTools.misc.fixedTools import otRound, fixedToFloat as fi2fl
 from fontTools.misc.loggingTools import deprecateFunction
-from fontTools.misc.transform import Transform
+from fontTools.misc.transform import Transform, DecomposedTransform
 from fontTools.pens.transformPen import TransformPen, TransformPointPen
 from fontTools.pens.recordingPen import (
     DecomposingRecordingPen,
     lerpRecordings,
     replayRecording,
 )
+
+
+def _getVariationAxes(font):
+    if "fvar" in font:
+        return font["fvar"].axes
+
+    # VARC permits static fonts to retain gvar or CFF2 variation data for
+    # component-internal coordinates without exposing axes through fvar.
+    axisCount = 0
+    gvar = font.get("gvar")
+    if gvar is not None:
+        axisCount = gvar.axisCount
+    if "CFF2" in font:
+        cff = next(iter(font["CFF2"].cff.values()))
+        varStore = getattr(cff.CharStrings, "varStore", None)
+        if varStore is not None:
+            axisCount = max(
+                axisCount, varStore.otVarStore.VarRegionList.RegionAxisCount
+            )
+    return [SimpleNamespace(axisTag=i) for i in range(axisCount)]
 
 
 class _TTGlyphSet(Mapping):
@@ -24,11 +45,8 @@ class _TTGlyphSet(Mapping):
     def __init__(self, font, location, glyphsMapping, *, recalcBounds=True):
         self.recalcBounds = recalcBounds
         self.font = font
-        self.defaultLocationNormalized = (
-            {axis.axisTag: 0 for axis in self.font["fvar"].axes}
-            if "fvar" in self.font
-            else {}
-        )
+        self.axes = _getVariationAxes(font)
+        self.defaultLocationNormalized = {axis.axisTag: 0 for axis in self.axes}
         self.location = location if location is not None else {}
         self.rawLocation = {}  # VarComponent-only location
         self.originalLocation = location if location is not None else {}
@@ -45,7 +63,7 @@ class _TTGlyphSet(Mapping):
             self.hvarTable = getattr(font.get("HVAR"), "table", None)
             if self.hvarTable is not None:
                 self.hvarInstancer = VarStoreInstancer(
-                    self.hvarTable.VarStore, font["fvar"].axes, location
+                    self.hvarTable.VarStore, self.axes, location
                 )
             # TODO VVAR, VORG
 
@@ -108,19 +126,46 @@ class _TTGlyphSetCFF(_TTGlyphSet):
         tableTag = "CFF2" if "CFF2" in font else "CFF "
         self.charStrings = list(font[tableTag].cff.values())[0].CharStrings
         super().__init__(font, location, self.charStrings)
+        self.setLocation(location)
+
+    def __getitem__(self, glyphName):
+        return _TTGlyphCFF(self, glyphName)
+
+    def setLocation(self, location):
         self.blender = None
         if location:
+            # TODO Optimize by using instancer.setLocation()
+
             from fontTools.varLib.varStore import VarStoreInstancer
 
             varStore = getattr(self.charStrings, "varStore", None)
             if varStore is not None:
-                instancer = VarStoreInstancer(
-                    varStore.otVarStore, font["fvar"].axes, location
-                )
+                instancer = VarStoreInstancer(varStore.otVarStore, self.axes, location)
                 self.blender = instancer.interpolateFromDeltas
+        else:
+            self.blender = None
+
+    @contextmanager
+    def pushLocation(self, location, reset: bool):
+        self.setLocation(location)
+        with _TTGlyphSet.pushLocation(self, location, reset) as value:
+            try:
+                yield value
+            finally:
+                self.setLocation(self.location)
+
+
+class _TTGlyphSetVARC(_TTGlyphSet):
+    def __init__(self, font, location, glyphSet):
+        self.glyphSet = glyphSet
+        super().__init__(font, location, glyphSet)
+        self.varcTable = font["VARC"].table
 
     def __getitem__(self, glyphName):
-        return _TTGlyphCFF(self, glyphName)
+        varc = self.varcTable
+        if glyphName not in varc.Coverage.glyphs:
+            return self.glyphSet[glyphName]
+        return _TTGlyphVARC(self, glyphName)
 
 
 class _TTGlyph(ABC):
@@ -178,10 +223,6 @@ class _TTGlyphGlyf(_TTGlyph):
             if depth:
                 offset = 0  # Offset should only apply at top-level
 
-            if glyph.isVarComposite():
-                self._drawVarComposite(glyph, pen, False)
-                return
-
             glyph.draw(pen, self.glyphSet.glyfTable, offset)
 
     def drawPoints(self, pen):
@@ -194,34 +235,7 @@ class _TTGlyphGlyf(_TTGlyph):
             if depth:
                 offset = 0  # Offset should only apply at top-level
 
-            if glyph.isVarComposite():
-                self._drawVarComposite(glyph, pen, True)
-                return
-
             glyph.drawPoints(pen, self.glyphSet.glyfTable, offset)
-
-    def _drawVarComposite(self, glyph, pen, isPointPen):
-        from fontTools.ttLib.tables._g_l_y_f import (
-            VarComponentFlags,
-            VAR_COMPONENT_TRANSFORM_MAPPING,
-        )
-
-        for comp in glyph.components:
-            with self.glyphSet.pushLocation(
-                comp.location, comp.flags & VarComponentFlags.RESET_UNSPECIFIED_AXES
-            ):
-                try:
-                    pen.addVarComponent(
-                        comp.glyphName, comp.transform, self.glyphSet.rawLocation
-                    )
-                except AttributeError:
-                    t = comp.transform.toTransform()
-                    if isPointPen:
-                        tPen = TransformPointPen(pen, t)
-                        self.glyphSet[comp.glyphName].drawPoints(tPen)
-                    else:
-                        tPen = TransformPen(pen, t)
-                        self.glyphSet[comp.glyphName].draw(tPen)
 
     def _getGlyphAndOffset(self):
         if self.glyphSet.location and self.glyphSet.gvarTable is not None:
@@ -283,6 +297,125 @@ class _TTGlyphCFF(_TTGlyph):
         self.glyphSet.charStrings[self.name].draw(pen, self.glyphSet.blender)
 
 
+def _evaluateCondition(condition, axes, location, instancer):
+    if condition.Format == 1:
+        # ConditionAxisRange
+        axisIndex = condition.AxisIndex
+        axisTag = axes[axisIndex].axisTag
+        axisValue = location.get(axisTag, 0)
+        minValue = condition.FilterRangeMinValue
+        maxValue = condition.FilterRangeMaxValue
+        return minValue <= axisValue <= maxValue
+    elif condition.Format == 2:
+        # ConditionValue
+        value = condition.DefaultValue
+        value += instancer[condition.VarIdx][0]
+        return value > 0
+    elif condition.Format == 3:
+        # ConditionAnd
+        for subcondition in condition.ConditionTable:
+            if not _evaluateCondition(subcondition, axes, location, instancer):
+                return False
+        return True
+    elif condition.Format == 4:
+        # ConditionOr
+        for subcondition in condition.ConditionTable:
+            if _evaluateCondition(subcondition, axes, location, instancer):
+                return True
+        return False
+    elif condition.Format == 5:
+        # ConditionNegate
+        return not _evaluateCondition(
+            condition.ConditionTable, axes, location, instancer
+        )
+    else:
+        return False  # Unkonwn condition format
+
+
+class _TTGlyphVARC(_TTGlyph):
+    def _draw(self, pen, isPointPen):
+        """Draw the glyph onto ``pen``. See fontTools.pens.basePen for details
+        how that works.
+        """
+        from fontTools.ttLib.tables.otTables import (
+            VarComponentFlags,
+            NO_VARIATION_INDEX,
+        )
+
+        glyphSet = self.glyphSet
+        varc = glyphSet.varcTable
+        idx = varc.Coverage.glyphs.index(self.name)
+        glyph = varc.VarCompositeGlyphs.VarCompositeGlyph[idx]
+
+        from fontTools.varLib.multiVarStore import MultiVarStoreInstancer
+        from fontTools.varLib.varStore import VarStoreInstancer
+
+        axes = glyphSet.axes
+        instancer = MultiVarStoreInstancer(
+            varc.MultiVarStore, axes, self.glyphSet.location
+        )
+
+        for comp in glyph.components:
+            if comp.flags & VarComponentFlags.HAVE_CONDITION:
+                condition = varc.ConditionList.ConditionTable[comp.conditionIndex]
+                if not _evaluateCondition(
+                    condition, axes, self.glyphSet.location, instancer
+                ):
+                    continue
+
+            location = {}
+            if comp.axisIndicesIndex is not None:
+                axisIndices = varc.AxisIndicesList.Item[comp.axisIndicesIndex]
+                axisValues = Vector(comp.axisValues)
+                if comp.axisValuesVarIndex != NO_VARIATION_INDEX:
+                    axisValues += fi2fl(instancer[comp.axisValuesVarIndex], 14)
+                assert len(axisIndices) == len(axisValues), (
+                    len(axisIndices),
+                    len(axisValues),
+                )
+                location = {axes[i].axisTag: v for i, v in zip(axisIndices, axisValues)}
+
+            if comp.transformVarIndex != NO_VARIATION_INDEX:
+                deltas = instancer[comp.transformVarIndex]
+                comp = deepcopy(comp)
+                comp.applyTransformDeltas(deltas)
+            transform = comp.transform
+
+            reset = comp.flags & VarComponentFlags.RESET_UNSPECIFIED_AXES
+            with self.glyphSet.glyphSet.pushLocation(location, reset):
+                with self.glyphSet.pushLocation(location, reset):
+                    shouldDecompose = self.name == comp.glyphName
+
+                    if not shouldDecompose:
+                        try:
+                            pen.addVarComponent(
+                                comp.glyphName, transform, self.glyphSet.rawLocation
+                            )
+                        except AttributeError:
+                            shouldDecompose = True
+
+                    if shouldDecompose:
+                        t = transform.toTransform()
+                        compGlyphSet = (
+                            self.glyphSet
+                            if comp.glyphName != self.name
+                            else glyphSet.glyphSet
+                        )
+                        g = compGlyphSet[comp.glyphName]
+                        if isPointPen:
+                            tPen = TransformPointPen(pen, t)
+                            g.drawPoints(tPen)
+                        else:
+                            tPen = TransformPen(pen, t)
+                            g.draw(tPen)
+
+    def draw(self, pen):
+        self._draw(pen, False)
+
+    def drawPoints(self, pen):
+        self._draw(pen, True)
+
+
 def _setCoordinates(glyph, coord, glyfTable, *, recalcBounds=True):
     # Handle phantom points for (left, right, top, bottom) positions.
     assert len(coord) >= 4
@@ -300,11 +433,6 @@ def _setCoordinates(glyph, coord, glyfTable, *, recalcBounds=True):
         for p, comp in zip(coord, glyph.components):
             if hasattr(comp, "x"):
                 comp.x, comp.y = p
-    elif glyph.isVarComposite():
-        glyph.components = [copy(comp) for comp in glyph.components]  # Shallow copy
-        for comp in glyph.components:
-            coord = comp.setCoordinates(coord)
-        assert not coord
     elif glyph.numberOfContours == 0:
         assert len(coord) == 0
     else:

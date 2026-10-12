@@ -12,7 +12,6 @@ import itertools
 from collections import deque
 import logging
 
-
 log = logging.getLogger(__name__)
 
 eblcHeaderFormat = """
@@ -66,6 +65,14 @@ codeOffsetPairSize = struct.calcsize(codeOffsetPairFormat)
 
 
 class table_E_B_L_C_(DefaultTable.DefaultTable):
+    """Embedded Bitmap Location table
+
+    The ``EBLC`` table contains the locations of monochrome or grayscale
+    bitmaps for glyphs. It must be used in concert with the ``EBDT`` table.
+
+    See also https://learn.microsoft.com/en-us/typography/opentype/spec/eblc
+    """
+
     dependencies = ["EBDT"]
 
     # This method can be overridden in subclasses to support new formats
@@ -114,13 +121,13 @@ class table_E_B_L_C_(DefaultTable.DefaultTable):
                 tup = struct.unpack(
                     indexSubTableArrayFormat, data[i : i + indexSubTableArraySize]
                 )
-                (firstGlyphIndex, lastGlyphIndex, additionalOffsetToIndexSubtable) = tup
+                firstGlyphIndex, lastGlyphIndex, additionalOffsetToIndexSubtable = tup
                 i = curTable.indexSubTableArrayOffset + additionalOffsetToIndexSubtable
 
                 tup = struct.unpack(
                     indexSubHeaderFormat, data[i : i + indexSubHeaderSize]
                 )
-                (indexFormat, imageFormat, imageDataOffset) = tup
+                indexFormat, imageFormat, imageDataOffset = tup
 
                 indexFormatClass = self.getIndexFormatClass(indexFormat)
                 indexSubTable = indexFormatClass(data[i + indexSubHeaderSize :], ttFont)
@@ -298,9 +305,9 @@ class BitmapSizeTable(object):
     # cares about in terms of XML creation.
     def _getXMLMetricNames(self):
         dataNames = sstruct.getformat(bitmapSizeTableFormatPart1)[1]
-        dataNames = dataNames + sstruct.getformat(bitmapSizeTableFormatPart2)[1]
+        dataNames = {**dataNames, **sstruct.getformat(bitmapSizeTableFormatPart2)[1]}
         # Skip the first 3 data names because they are byte offsets and counts.
-        return dataNames[3:]
+        return list(dataNames.keys())[3:]
 
     def toXML(self, writer, ttFont):
         writer.begintag("bitmapSizeTable")
@@ -460,7 +467,7 @@ class EblcIndexSubTable(object):
         # Determines if a name, location pair is a valid data location.
         # Skip glyphs are marked when the size is equal to zero.
         def isValidLocation(args):
-            (name, (startByte, endByte)) = args
+            name, (startByte, endByte) = args
             return startByte < endByte
 
         # Remove all skip glyphs.

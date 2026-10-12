@@ -30,7 +30,6 @@ def test_max_ctx_calc_features():
         sub A B C by c;
         sub [A B] C by c;
         sub [A B] C [A B] by c;
-        sub A by A B;
         sub A' C by A B;
         sub a' by b;
         sub a' b by c;
@@ -39,8 +38,8 @@ def test_max_ctx_calc_features():
         rsub a' by b;
         rsub a b' by c;
         rsub a b' c by A;
+        rsub [a b] [a b c]' [a b] by B;
         rsub [a b] c' by A;
-        rsub [a b] c' [a b] by B;
         lookup GSUB_EXT;
     } sub1;
 

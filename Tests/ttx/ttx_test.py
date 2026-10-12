@@ -2,7 +2,12 @@ from fontTools.misc.testTools import parseXML
 from fontTools.misc.timeTools import timestampSinceEpoch
 from fontTools.ttLib import TTFont, TTLibError
 from fontTools.ttLib.tables.DefaultTable import DefaultTable
+from fontTools.fontBuilder import FontBuilder
+from fontTools.ttLib.tables._n_a_m_e import table__n_a_m_e
+from fontTools.ttLib.tables._g_l_y_f import Glyph
+
 from fontTools import ttx
+
 import base64
 import getopt
 import logging
@@ -68,6 +73,32 @@ class TTXTest(unittest.TestCase):
     # -----
     # Tests
     # -----
+
+    def test_saveXML_replace_control_characters(self):
+        fb = FontBuilder(unitsPerEm=1000, isTTF=True)
+        fb.setupGlyphOrder([".notdef"])
+        fb.setupCharacterMap({})
+        fb.setupGlyf({".notdef": Glyph()})
+        fb.setupHorizontalMetrics({".notdef": (600, 0)})
+        fb.setupHorizontalHeader(ascent=800, descent=-200)
+        fb.setupOS2()
+        fb.setupPost()
+        # Setup name record with illegal control character
+        nameStr = "Control\x01Char"
+        replaced = nameStr.replace("\x01", "?")
+        fb.setupNameTable({"familyName": nameStr})
+        self.temp_dir()
+        ttx_path = Path(self.tempdir) / "test.ttx"
+        # Capture logs
+        with self.assertLogs("fontTools.ttx", level="WARNING") as cm:
+            fb.font.saveXML(str(ttx_path))
+        # Test replacement
+        xml_content = ttx_path.read_text(encoding="utf-8")
+        self.assertIn(replaced, xml_content)
+        self.assertNotIn("\x01", xml_content)
+        warnings = "\n".join(cm.output)
+        self.assertIn("Illegal XML character(s) found", warnings)
+        self.assertIn("\\x01", warnings)
 
     def test_parseOptions_no_args(self):
         with self.assertRaises(getopt.GetoptError) as cm:
@@ -471,7 +502,7 @@ def test_options_recalc_timestamp():
     assert tto.recalcTimestamp is True
 
 
-def test_options_recalc_timestamp():
+def test_options_no_recalc_timestamp():
     tto = ttx.Options([("--no-recalc-timestamp", "")], 1)
     assert tto.recalcTimestamp is False
 
@@ -1018,6 +1049,15 @@ def test_main_ttx_compile_stdin_to_stdout(tmp_path):
     assert outpath.is_file()
 
 
+def test_main_gnu_style_opts_and_args_intermixed(tmpdir):
+    # https://github.com/fonttools/fonttools/issues/3507
+    inpath = os.path.join("Tests", "ttx", "data", "TestTTF.ttf")
+    outpath = tmpdir.join("TestTTF.ttx")
+    args = ["-t", "cmap", inpath, "-o", str(outpath)]
+    ttx.main(args)
+    assert outpath.check(file=True)
+
+
 def test_roundtrip_DSIG_split_at_XML_parse_buffer_size(tmp_path):
     inpath = Path("Tests").joinpath(
         "ttx", "data", "roundtrip_DSIG_split_at_XML_parse_buffer_size.ttx"
@@ -1047,6 +1087,19 @@ def test_roundtrip_DSIG_split_at_XML_parse_buffer_size(tmp_path):
     assert TTFont(outpath)["DSIG"].signatureRecords[0].pkcs7 == base64.b64decode(
         b"0000000100000000"
     )
+
+
+def test_main_ttx_compile_optimize_font_speed(tmp_path):
+    inpath = Path("Tests") / "ttx" / "data" / "TestTTF.ttx"
+
+    size_optimized = tmp_path / "TestTTF-size.ttf"
+    ttx.main(["-o", str(size_optimized), str(inpath)])
+
+    speed_optimized = tmp_path / "TestTTF-speed.ttf"
+    ttx.main(["--optimize-font-speed", "-o", str(speed_optimized), str(inpath)])
+
+    # the speed-optimized font should end up larger than the size-optimized one
+    assert size_optimized.stat().st_size < speed_optimized.stat().st_size
 
 
 # ---------------------------

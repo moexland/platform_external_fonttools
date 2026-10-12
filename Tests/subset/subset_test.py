@@ -1,4 +1,5 @@
 import io
+from fontTools.ttLib.tables._n_a_m_e import NameRecordVisitor
 import fontTools.ttLib.tables.otBase
 from fontTools.misc.testTools import getXML, stripVariableItemsFromTTX
 from fontTools.misc.textTools import tobytes, tostr
@@ -233,6 +234,13 @@ class SubsetTest:
         subsetfont = TTFont(subsetpath)
         self.expect_ttx(subsetfont, self.getpath("expect_bsln_3.ttx"), ["bsln"])
 
+    def test_subset_BASE(self):
+        fontpath = self.compile_font(self.getpath("TestBASE.ttx"), ".ttf")
+        subsetpath = self.temp_path(".ttf")
+        subset.main([fontpath, "--gids=2,3", "--output-file=%s" % subsetpath])
+        subsetfont = TTFont(subsetpath)
+        self.expect_ttx(subsetfont, self.getpath("expect_BASE.ttx"), ["BASE"])
+
     def test_subset_clr(self):
         fontpath = self.compile_font(self.getpath("TestCLR-Regular.ttx"), ".ttf")
         subsetpath = self.temp_path(".ttf")
@@ -319,6 +327,37 @@ class SubsetTest:
         subset.main([fontpath, "--text=A", "--output-file=%s" % subsetpath])
         subsetfont = TTFont(subsetpath)
         self.expect_ttx(subsetfont, self.getpath("expect_math_partial.ttx"), ["MATH"])
+
+    def test_subset_math_closure_drops_added_glyph_constructions(self):
+        # Regression test for https://github.com/fonttools/fonttools/pull/4096
+        # The test font has glyphs ".notdef, A, A.size1, A.size2"; only "A" is
+        # reachable via cmap. "A.size1" is both a vertical variant of "A" and a
+        # construction base of its own that grows into "A.size2". Subsetting to
+        # "A" pulls in "A.size1" via closure but must not retain "A.size1"'s
+        # construction, which would dangle a reference to the never-closed-over
+        # "A.size2".
+        fontpath = self.compile_font(self.getpath("test_math_closure.ttx"), ".ttf")
+        font = TTFont(fontpath)
+
+        subsetter = subset.Subsetter()
+        subsetter.populate(text="A")
+        subsetter.subset(font)
+
+        glyph_set = set(font.getGlyphOrder())
+        # "A.size1" survives: it is a legitimate variant of the requested "A".
+        assert "A.size1" in glyph_set
+        # "A.size2" was never closed over, so it is not in the subset.
+        assert "A.size2" not in glyph_set
+
+        math_variants = font["MATH"].table.MathVariants
+        # Only "A" keeps a construction; "A.size1"'s construction is dropped
+        # because "A.size1" entered the subset solely through closure.
+        assert list(math_variants.VertGlyphCoverage.glyphs) == ["A"]
+        assert math_variants.VertGlyphCount == 1
+        # No surviving construction references a glyph outside the subset.
+        for cons in math_variants.VertGlyphConstruction:
+            for rec in cons.MathGlyphVariantRecord:
+                assert rec.VariantGlyph in glyph_set
 
     def test_subset_opbd_remove(self):
         # In the test font, only the glyphs 'A' and 'zero' have an entry in
@@ -428,14 +467,93 @@ class SubsetTest:
     def test_varComposite(self):
         fontpath = self.getpath("..", "..", "ttLib", "data", "varc-ac00-ac01.ttf")
         origfont = TTFont(fontpath)
-        assert len(origfont.getGlyphOrder()) == 6
+        assert len(origfont.getGlyphOrder()) == 11
         subsetpath = self.temp_path(".ttf")
         subset.main([fontpath, "--unicodes=ac00", "--output-file=%s" % subsetpath])
         subsetfont = TTFont(subsetpath)
-        assert len(subsetfont.getGlyphOrder()) == 4
+        assert len(subsetfont.getGlyphOrder()) == 6
+        varc = subsetfont["VARC"].table
+        assert len(varc.AxisIndicesList.Item) == 2
+        assert len(varc.MultiVarStore.MultiVarData) == 1
+        assert len(varc.MultiVarStore.MultiVarData[0].Item) == 2
+        assert len(varc.MultiVarStore.SparseVarRegionList.Region) == 3
         subset.main([fontpath, "--unicodes=ac01", "--output-file=%s" % subsetpath])
         subsetfont = TTFont(subsetpath)
-        assert len(subsetfont.getGlyphOrder()) == 5
+        assert len(subsetfont.getGlyphOrder()) == 8
+        varc = subsetfont["VARC"].table
+        assert len(varc.AxisIndicesList.Item) == 2
+        assert len(varc.MultiVarStore.MultiVarData) == 1
+        assert len(varc.MultiVarStore.MultiVarData[0].Item) == 5
+        assert len(varc.MultiVarStore.SparseVarRegionList.Region) == 3
+
+    def test_varComposite_condition_varidx(self):
+        fontpath = self.getpath("..", "..", "ttLib", "data", "varc-ac00-ac01.ttf")
+        font = TTFont(fontpath)
+        varc = font["VARC"].table
+
+        def makeCondition(varIdx):
+            condition = ot.ConditionTable()
+            condition.Format = 2
+            condition.DefaultValue = 0
+            condition.VarIdx = varIdx
+            return condition
+
+        unusedCondition = makeCondition(5)
+        negatedCondition = ot.ConditionTable()
+        negatedCondition.Format = 5
+        negatedCondition.ConditionTable = makeCondition(4)
+        usedCondition = ot.ConditionTable()
+        usedCondition.Format = 3
+        usedCondition.ConditionTable = [makeCondition(6), negatedCondition]
+
+        conditionList = ot.ConditionList()
+        conditionList.ConditionTable = [unusedCondition, usedCondition]
+        varc.ConditionList = conditionList
+        varc.VarCompositeGlyphs.VarCompositeGlyph[0].components[0].conditionIndex = 1
+
+        inputpath = self.temp_path(".ttf")
+        font.save(inputpath)
+        subsetpath = self.temp_path(".ttf")
+        subset.main([inputpath, "--unicodes=ac00", "--output-file=%s" % subsetpath])
+
+        subsetfont = TTFont(subsetpath)
+        varc = subsetfont["VARC"].table
+        assert len(varc.ConditionList.ConditionTable) == 1
+        condition = varc.ConditionList.ConditionTable[0]
+        assert condition.ConditionTable[0].VarIdx == 3
+        assert condition.ConditionTable[1].ConditionTable.VarIdx == 2
+        assert len(varc.MultiVarStore.MultiVarData) == 1
+        assert len(varc.MultiVarStore.MultiVarData[0].Item) == 4
+
+    def test_varComposite_drops_empty_auxiliary_data(self):
+        fontpath = self.getpath("..", "..", "ttLib", "data", "varc-ac00-ac01.ttf")
+        font = TTFont(fontpath)
+        varc = font["VARC"].table
+        for glyph in varc.VarCompositeGlyphs.VarCompositeGlyph:
+            for component in glyph.components:
+                component.axisIndicesIndex = None
+                component.axisValues = ()
+                component.axisValuesVarIndex = ot.NO_VARIATION_INDEX
+                component.transformVarIndex = ot.NO_VARIATION_INDEX
+
+        conditionList = ot.ConditionList()
+        condition = ot.ConditionTable()
+        condition.Format = 1
+        condition.AxisIndex = 0
+        condition.FilterRangeMinValue = 0
+        condition.FilterRangeMaxValue = 1
+        conditionList.ConditionTable = [condition]
+        varc.ConditionList = conditionList
+
+        inputpath = self.temp_path(".ttf")
+        font.save(inputpath)
+        subsetpath = self.temp_path(".ttf")
+        subset.main([inputpath, "--unicodes=ac00", "--output-file=%s" % subsetpath])
+
+        varc = TTFont(subsetpath)["VARC"].table
+        assert varc.MultiVarStore is None
+        assert varc.ConditionList is None
+        assert varc.AxisIndicesList is None
 
     def test_timing_publishes_parts(self):
         fontpath = self.compile_font(self.getpath("TestTTF-Regular.ttx"), ".ttf")
@@ -486,7 +604,7 @@ class SubsetTest:
             self.getpath("TestTTF-Regular_non_BMP_char.ttx"), ".ttf"
         )
         subsetpath = self.temp_path(".ttf")
-        text = tostr("A\U0001F6D2", encoding="utf-8")
+        text = tostr("A\U0001f6d2", encoding="utf-8")
 
         subset.main([fontpath, "--text=%s" % text, "--output-file=%s" % subsetpath])
         subsetfont = TTFont(subsetpath)
@@ -499,7 +617,7 @@ class SubsetTest:
             self.getpath("TestTTF-Regular_non_BMP_char.ttx"), ".ttf"
         )
         subsetpath = self.temp_path(".ttf")
-        text = tobytes("A\U0001F6D2", encoding="utf-8")
+        text = tobytes("A\U0001f6d2", encoding="utf-8")
         with tempfile.NamedTemporaryFile(delete=False) as tmp:
             tmp.write(text)
 
@@ -920,6 +1038,64 @@ class SubsetTest:
 
         assert ttf.flavor is None
 
+    @pytest.mark.parametrize("flavor", ["woff", "woff2"])
+    def test_subset_inherits_flavor(self, flavor):
+        if flavor == "woff2":
+            pytest.importorskip("brotli")
+
+        ttf_path = self.compile_font(self.getpath("TestTTF-Regular.ttx"), ".ttf")
+        input_path = self.temp_path(f".{flavor}")
+        font = TTFont(ttf_path)
+        font.flavor = flavor
+        font.save(input_path)
+
+        subset.main([input_path, "*"])
+        output_path = os.path.splitext(input_path)[0] + f".subset.{flavor}"
+
+        assert TTFont(output_path).flavor == flavor
+
+    @pytest.mark.parametrize("token", ["none", "None", "NONE", ""])
+    @pytest.mark.parametrize("flavor", ["woff", "woff2"])
+    def test_subset_flavor_none_from_woff(self, token, flavor):
+        if flavor == "woff2":
+            pytest.importorskip("brotli")
+
+        ttf_path = self.compile_font(self.getpath("TestTTF-Regular.ttx"), ".ttf")
+        input_path = self.temp_path(f".{flavor}")
+        font = TTFont(ttf_path)
+        font.flavor = flavor
+        font.save(input_path)
+
+        subset.main([input_path, "*", f"--flavor={token}"])
+        output_path = os.path.splitext(input_path)[0] + ".subset.ttf"
+
+        assert os.path.isfile(output_path)
+        assert TTFont(output_path).flavor is None
+
+    def test_subset_flavor_none_from_cff_woff_uses_otf_extension(self):
+        otf_path = self.compile_font(self.getpath("TestOTF-Regular.ttx"), ".otf")
+        input_path = self.temp_path(".woff")
+        font = TTFont(otf_path)
+        font.flavor = "woff"
+        font.save(input_path)
+
+        subset.main([input_path, "*", "--flavor=none"])
+        output_path = os.path.splitext(input_path)[0] + ".subset.otf"
+
+        assert os.path.isfile(output_path)
+        out = TTFont(output_path)
+        assert out.flavor is None
+        assert out.sfntVersion == "OTTO"
+
+    def test_subset_flavor_invalid(self, capsys):
+        fontpath = self.compile_font(self.getpath("TestTTF-Regular.ttx"), ".ttf")
+
+        rc = subset.main([fontpath, "*", "--flavor=ttf"])
+
+        assert rc == 2
+        err = capsys.readouterr().err
+        assert "Invalid --flavor" in err
+
     def test_subset_context_subst_format_3(self):
         # https://github.com/fonttools/fonttools/issues/1879
         # Test font contains 'calt' feature with Format 3 ContextSubst lookup subtables
@@ -937,6 +1113,34 @@ class SubsetTest:
         subset.main([fontpath, "--glyphs=a", "--output-file=%s" % subsetpath])
         subsetfont = TTFont(subsetpath)
         self.expect_ttx(subsetfont, self.getpath("CmapSubsetTest.subset.ttx"), ["cmap"])
+
+    def test_cmap_format14(self):
+        fontpath = self.compile_font(self.getpath("cmap14_font1.ttx"), ".otf")
+        subsetpath = self.temp_path(".otf")
+
+        subset.main([fontpath, "--unicodes=4e05", "--output-file=%s" % subsetpath])
+        subsetfont = TTFont(subsetpath)
+        self.expect_ttx(subsetfont, self.getpath("cmap14_font1.no_uvs.ttx"), ["cmap"])
+
+        subset.main(
+            [fontpath, "--unicodes=4e05,e0100", "--output-file=%s" % subsetpath]
+        )
+        subsetfont = TTFont(subsetpath)
+        self.expect_ttx(subsetfont, self.getpath("cmap14_font1.uvs.ttx"), ["cmap"])
+
+        subset.main([fontpath, "--unicodes=4e10", "--output-file=%s" % subsetpath])
+        subsetfont = TTFont(subsetpath)
+        self.expect_ttx(
+            subsetfont, self.getpath("cmap14_font1.no_uvs_non_default.ttx"), ["cmap"]
+        )
+
+        subset.main(
+            [fontpath, "--unicodes=4e10,e0100", "--output-file=%s" % subsetpath]
+        )
+        subsetfont = TTFont(subsetpath)
+        self.expect_ttx(
+            subsetfont, self.getpath("cmap14_font1.uvs_non_default.ttx"), ["cmap"]
+        )
 
     @pytest.mark.parametrize("text, n", [("!", 1), ("#", 2)])
     def test_GPOS_PairPos_Format2_useClass0(self, text, n):
@@ -1001,20 +1205,13 @@ class SubsetTest:
             if not have_uharfbuzz:
                 pytest.skip("uharfbuzz is not installed")
             if not ok:
-                # pretend hb.repack/repack_with_tag return an error
+                # pretend hb.serialize_with_tag return an error
                 import uharfbuzz as hb
 
-                def mock_repack(data, obj_list):
+                def mock_serialize_with_tag(tag, data, obj_list):
                     raise hb.RepackerError("mocking")
 
-                monkeypatch.setattr(hb, "repack", mock_repack)
-
-                if hasattr(hb, "repack_with_tag"):  # uharfbuzz >= 0.30.0
-
-                    def mock_repack_with_tag(tag, data, obj_list):
-                        raise hb.RepackerError("mocking")
-
-                    monkeypatch.setattr(hb, "repack_with_tag", mock_repack_with_tag)
+                monkeypatch.setattr(hb, "serialize_with_tag", mock_serialize_with_tag)
         else:
             if have_uharfbuzz:
                 # pretend uharfbuzz is not installed
@@ -1103,13 +1300,11 @@ def featureVarsTestFont():
     fb.setupNameTable({"familyName": "TestFeatureVars", "styleName": "Regular"})
     fb.setupPost()
     fb.setupFvar(axes=[("wght", 100, 400, 900, "Weight")], instances=[])
-    fb.addOpenTypeFeatures(
-        """\
+    fb.addOpenTypeFeatures("""\
         feature dlig {
             sub f f by f_f;
         } dlig;
-    """
-    )
+    """)
     fb.addFeatureVariations(
         [([{"wght": (0.20886, 1.0)}], {"dollar": "dollar.rvrn"})], featureTag="rvrn"
     )
@@ -1167,15 +1362,13 @@ def singlepos2_font():
     fb.setupCharacterMap({ord("a"): "a", ord("b"): "b", ord("c"): "c"})
     fb.setupNameTable({"familyName": "TestSingePosFormat", "styleName": "Regular"})
     fb.setupPost()
-    fb.addOpenTypeFeatures(
-        """
+    fb.addOpenTypeFeatures("""
         feature kern {
             pos a -50;
             pos b -40;
             pos c -50;
         } kern;
-    """
-    )
+    """)
 
     buf = io.BytesIO()
     fb.save(buf)
@@ -1752,7 +1945,7 @@ def test_subset_COLRv1_drop_all_v0_glyphs(colrv1_path):
     assert colr.table.BaseGlyphRecordCount == 0
     assert colr.table.BaseGlyphRecordArray is None
     assert colr.table.LayerRecordArray is None
-    assert colr.table.LayerRecordCount is 0
+    assert colr.table.LayerRecordCount == 0
 
 
 def test_subset_COLRv1_no_ClipList(colrv1_path):
@@ -1783,8 +1976,7 @@ def test_subset_keep_size_drop_empty_stylistic_set():
     fb.setupOS2()
     fb.setupPost()
     fb.setupNameTable({"familyName": "TestKeepSizeFeature", "styleName": "Regular"})
-    fb.addOpenTypeFeatures(
-        """
+    fb.addOpenTypeFeatures("""
         feature size {
           parameters 10.0 0;
         } size;
@@ -1794,8 +1986,7 @@ def test_subset_keep_size_drop_empty_stylistic_set():
           };
           sub b by b.ss01;
         } ss01;
-    """
-    )
+    """)
 
     buf = io.BytesIO()
     fb.save(buf)
@@ -1915,10 +2106,6 @@ def test_subset_recalc_xAvgCharWidth(ttf_path):
     assert xAvgCharWidth_after == subset_font["OS/2"].xAvgCharWidth
 
 
-if __name__ == "__main__":
-    sys.exit(unittest.main())
-
-
 def test_subset_prune_gdef_markglyphsetsdef():
     # GDEF_MarkGlyphSetsDef
     fb = FontBuilder(unitsPerEm=1000, isTTF=True)
@@ -1944,8 +2131,7 @@ def test_subset_prune_gdef_markglyphsetsdef():
     fb.setupNameTable(
         {"familyName": "TestGDEFMarkGlyphSetsDef", "styleName": "Regular"}
     )
-    fb.addOpenTypeFeatures(
-        """
+    fb.addOpenTypeFeatures("""
         feature ccmp {
             lookup ccmp_1 {
                 lookupflag UseMarkFilteringSet [acutecomb];
@@ -1964,8 +2150,7 @@ def test_subset_prune_gdef_markglyphsetsdef():
                 sub A acutecomb by Aacute;
             } ccmp_3;
         } ccmp;
-    """
-    )
+    """)
 
     buf = io.BytesIO()
     fb.save(buf)
@@ -2019,7 +2204,106 @@ def test_subset_prune_gdef_markglyphsetsdef():
     lookups = font["GSUB"].table.LookupList.Lookup
     assert lookups[0].LookupFlag == 16
     assert lookups[0].MarkFilteringSet == 0
-    assert lookups[1].LookupFlag == 0
+    assert lookups[1].LookupFlag == 8
     assert lookups[1].MarkFilteringSet == None
     marksets = font["GDEF"].table.MarkGlyphSetsDef.Coverage
     assert marksets[0].glyphs == ["acutecomb"]
+
+
+def test_prune_user_name_IDs_with_keep_all(ttf_path):
+    font = TTFont(ttf_path)
+
+    keepNameIDs = {n.nameID for n in font["name"].names}
+
+    for i in range(10):
+        font["name"].addName(f"Test{i}")
+
+    options = subset.Options()
+    options.name_IDs = ["*"]
+    options.name_legacy = True
+    options.name_languages = ["*"]
+
+    subsetter = subset.Subsetter(options)
+    subsetter.populate(unicodes=font.getBestCmap().keys())
+    subsetter.subset(font)
+
+    nameIDs = {n.nameID for n in font["name"].names}
+    assert not any(n > 255 for n in nameIDs)
+    assert nameIDs == keepNameIDs
+
+
+def test_prune_unused_user_name_IDs_with_keep_all(ttf_path):
+    font = TTFont(ttf_path)
+
+    keepNameIDs = {n.nameID for n in font["name"].names}
+
+    for i in range(10):
+        font["name"].addName(f"Test{i}")
+
+    nameID = font["name"].addName("Test STAT")
+    keepNameIDs.add(nameID)
+
+    font["STAT"] = newTable("STAT")
+    font["STAT"].table = ot.STAT()
+    font["STAT"].table.ElidedFallbackNameID = nameID
+
+    options = subset.Options()
+    options.name_IDs = ["*"]
+    options.name_legacy = True
+    options.name_languages = ["*"]
+
+    subsetter = subset.Subsetter(options)
+    subsetter.populate(unicodes=font.getBestCmap().keys())
+    subsetter.subset(font)
+
+    nameIDs = {n.nameID for n in font["name"].names}
+    assert nameIDs == keepNameIDs
+
+
+def test_cvXX_feature_params_nameIDs_are_retained():
+    # https://github.com/fonttools/fonttools/issues/3616
+    font = TTFont()
+    ttx = pathlib.Path(__file__).parent / "data" / "Andika-Regular.subset.ttx"
+    font.importXML(ttx)
+
+    keepNameIDs = {n.nameID for n in font["name"].names}
+
+    options = subset.Options()
+    options.glyph_names = True
+    # that's where the FeatureParamsCharacteVariants are stored
+    options.layout_features.append("cv43")
+
+    subsetter = subset.Subsetter(options)
+    subsetter.populate(glyphs=font.getGlyphOrder())
+    subsetter.subset(font)
+
+    # we expect that all nameIDs are retained, including all the nameIDs
+    # used by the FeatureParamsCharacterVariants
+    nameIDs = {n.nameID for n in font["name"].names}
+    assert nameIDs == keepNameIDs
+
+
+def test_preserve_name_ids_when_used_elsewhere():
+    font = TTFont()
+    ttx = pathlib.Path(__file__).parent / "data" / "PreserveSillyNamesTest.ttx"
+    font.importXML(ttx)
+
+    visitor = NameRecordVisitor()
+    visitor.visit(font)
+    assert visitor.seen.intersection(subset.NAME_IDS_TO_OBFUSCATE)
+
+    options = subset.Options(obfuscate_names=True)
+    subsetter = subset.Subsetter(options)
+    subsetter.populate(glyphs=font.getGlyphOrder())
+    subsetter.subset(font)
+
+    # After obfuscation, all names should use an id >= 256, except for id 5,
+    # which is not obfuscated.
+    visitor = NameRecordVisitor()
+    visitor.TABLES = ("STAT", "fvar")
+    visitor.visit(font)
+    assert all(id >= 256 or id == 5 for id in visitor.seen)
+
+
+if __name__ == "__main__":
+    sys.exit(unittest.main())

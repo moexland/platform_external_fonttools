@@ -594,8 +594,8 @@ class TupleVariationTest(unittest.TestCase):
         self.assertEqual("02 01 02 04", hexencode(var.compileDeltas()))
 
     def test_compileDeltaValues(self):
-        compileDeltaValues = lambda values: hexencode(
-            TupleVariation.compileDeltaValues_(values)
+        compileDeltaValues = lambda values, optimizeSize=True: hexencode(
+            TupleVariation.compileDeltaValues_(values, optimizeSize=optimizeSize)
         )
         # zeroes
         self.assertEqual("80", compileDeltaValues([0]))
@@ -635,17 +635,33 @@ class TupleVariationTest(unittest.TestCase):
         )
         # bytes, zeroes
         self.assertEqual("01 01 00", compileDeltaValues([1, 0]))
+        self.assertEqual("01 01 00", compileDeltaValues([1, 0], optimizeSize=False))
         self.assertEqual("00 01 81", compileDeltaValues([1, 0, 0]))
+        self.assertEqual(
+            "02 01 00 00", compileDeltaValues([1, 0, 0], optimizeSize=False)
+        )
         # words, bytes, words: a single byte is more compact when encoded as part of the words run
         self.assertEqual(
             "42 66 66 00 02 77 77", compileDeltaValues([0x6666, 2, 0x7777])
         )
         self.assertEqual(
+            "42 66 66 00 02 77 77",
+            compileDeltaValues([0x6666, 2, 0x7777], optimizeSize=False),
+        )
+        self.assertEqual(
             "40 66 66 01 02 02 40 77 77", compileDeltaValues([0x6666, 2, 2, 0x7777])
+        )
+        self.assertEqual(
+            "43 66 66 00 02 00 02 77 77",
+            compileDeltaValues([0x6666, 2, 2, 0x7777], optimizeSize=False),
         )
         # words, zeroes, words
         self.assertEqual(
             "40 66 66 80 40 77 77", compileDeltaValues([0x6666, 0, 0x7777])
+        )
+        self.assertEqual(
+            "42 66 66 00 00 77 77",
+            compileDeltaValues([0x6666, 0, 0x7777], optimizeSize=False),
         )
         self.assertEqual(
             "40 66 66 81 40 77 77", compileDeltaValues([0x6666, 0, 0, 0x7777])
@@ -946,23 +962,6 @@ class TupleVariationTest(unittest.TestCase):
         var.optimize([(0, 0)] * 5, [0])
 
         self.assertEqual(var.coordinates, [None, None, None, None, None])
-
-    def test_optimize_isComposite(self):
-        # when a composite glyph's deltas are all (0, 0), we still want
-        # to write out an entry in gvar, else macOS doesn't apply any
-        # variations to the composite glyph (even if its individual components
-        # do vary).
-        # https://github.com/fonttools/fonttools/issues/1381
-        var = TupleVariation({"wght": (0.0, 1.0, 1.0)}, [(0, 0)] * 5)
-        var.optimize([(0, 0)] * 5, [0], isComposite=True)
-        self.assertEqual(var.coordinates, [(0, 0)] * 5)
-
-        # it takes more than 128 (0, 0) deltas before the optimized tuple with
-        # (None) inferred deltas (except for the first) becomes smaller than
-        # the un-optimized one that has all deltas explicitly set to (0, 0).
-        var = TupleVariation({"wght": (0.0, 1.0, 1.0)}, [(0, 0)] * 129)
-        var.optimize([(0, 0)] * 129, list(range(129 - 4)), isComposite=True)
-        self.assertEqual(var.coordinates, [(0, 0)] + [None] * 128)
 
     def test_sum_deltas_gvar(self):
         var1 = TupleVariation(

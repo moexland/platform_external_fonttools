@@ -12,6 +12,8 @@ from collections import defaultdict
 from operator import add
 from functools import reduce
 
+__all__ = ["optimizeWidths", "main"]
+
 
 class missingdict(dict):
     def __init__(self, missing_func):
